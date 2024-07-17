@@ -1,0 +1,11 @@
+---
+username: YOUR_USERNAME
+password: YOUR_PASSWORD
+address: LOCAL_ENVOY_URL
+serial: YOUR_ENVOY_SERIAL_NUMBER
+source: power-meter
+jwt: YOUR_JWT_TOKEN (OPTIONAL)
+influxdb: YOUR INFLUXDB HOST:PORT
+influxdb_token: 
+influxdb_org: my_org
+influxdb_bucket: my_bucket
