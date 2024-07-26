@@ -1,0 +1,17 @@
+[Unit]
+Description=Envoy Exporter Daemon
+StartLimitIntervalSec=30
+StartLimitBurst=2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hobe
+Group=hobe
+LimitMEMLOCK=2048000
+Type=simple
+ExecStart=/usr/bin/envoy-exporter -config /etc/envoy-exporter/envoy.yaml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
