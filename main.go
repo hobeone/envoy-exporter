@@ -114,7 +114,9 @@ func scrape(e *envoy.Client) int {
 	if err != nil {
 		log.Errorf("Error getting Inverter data from Envoy: %v", err)
 	}
-	points = append(points, extractInverterStats(inverters)...)
+	if inverters != nil && len(*inverters) > 0 {
+		points = append(points, extractInverterStats(inverters)...)
+	}
 
 	batteries, _, err := e.Batteries()
 	if err != nil {
