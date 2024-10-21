@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -226,6 +227,7 @@ func main() {
 	if cfg.InfluxDBOrg == "" {
 		log.Fatal("Missing required configuration: influxdb_org")
 	}
+	log.Infof("Build with Go version: %s\n", runtime.Version())
 	log.Infof("Scraping envoy at: %s with serial number %s every %d seconds", cfg.Address, cfg.SerialNumber, cfg.Interval)
 	log.Infof("Writing to Influxdb: %s, Bucket '%s'", cfg.InfluxDB, cfg.InfluxDBBucket)
 	scrapeLoop()
