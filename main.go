@@ -1,5 +1,8 @@
 /*
 Copyright © 2024 Daniel Hobe hobe@gmail.com
+
+JWT token can be gotten from:
+https://enlighten.enphaseenergy.com/entrez-auth-token?serial_num=YOURSERIAL_NUM_HERE
 */
 package main
 
@@ -14,11 +17,11 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v3"
+	yaml "gopkg.in/yaml.v3"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
-	"github.com/loafoe/go-envoy"
+	envoy "github.com/loafoe/go-envoy"
 )
 
 var (
@@ -150,8 +153,9 @@ func scrapeLoop() {
 		if err != nil {
 			log.Error(err)
 			time.Sleep(interval)
+		} else {
+			connected = true
 		}
-		connected = true
 	}
 	for {
 		tStat := time.Now()
