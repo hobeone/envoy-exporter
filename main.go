@@ -97,16 +97,14 @@ func extractBatteryStats(batteries *[]envoy.Battery) []*influxdb2write.Point {
 }
 
 func scrape(e *envoy.Client) int {
-	cr, resp, err := e.CommCheck()
+	cr, err := e.CommCheck()
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
-			e.InvalidateSession() // Token expired?
-		}
+		e.InvalidateSession() // Token expired?
 	}
 	if cr != nil {
 		log.Infof("Found devices: %d", len(*cr))
 	}
-	prod, _, err := e.Production()
+	prod, err := e.Production()
 	if err != nil {
 		log.Errorf("Error getting Production data from Envoy: %v", err)
 	}
@@ -114,7 +112,7 @@ func scrape(e *envoy.Client) int {
 	if prod != nil && len(prod.Production) > 0 {
 		points = append(points, extractProductionStats(prod)...)
 	}
-	inverters, _, err := e.Inverters()
+	inverters, err := e.Inverters()
 	if err != nil {
 		log.Errorf("Error getting Inverter data from Envoy: %v", err)
 	}
@@ -122,7 +120,7 @@ func scrape(e *envoy.Client) int {
 		points = append(points, extractInverterStats(inverters)...)
 	}
 
-	batteries, _, err := e.Batteries()
+	batteries, err := e.Batteries()
 	if err != nil {
 		log.Errorf("Error getting Battery data from Envoy: %v", err)
 	} else {
