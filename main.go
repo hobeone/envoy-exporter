@@ -20,6 +20,7 @@ import (
 	yaml "gopkg.in/yaml.v3"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	influxdb2api "github.com/influxdata/influxdb-client-go/v2/api"
 	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
 	envoy "github.com/loafoe/go-envoy"
 )
@@ -76,7 +77,7 @@ func loadAndValidateConfig(filePath string) (Config, error) {
 }
 
 type EnvoyClientInterface interface {
-	CommCheck() (*[]envoy.CommCheckDevice, error)
+	CommCheck() (*envoy.CommCheckResponse, error)
 	Production() (*envoy.ProductionResponse, error)
 	Inverters() (*[]envoy.Inverter, error)
 	Batteries() (*[]envoy.Battery, error)
@@ -98,6 +99,9 @@ func lineToPoint(lineType string, line envoy.Line, idx int, ts time.Time) *influ
 
 func extractProductionStats(prod *envoy.ProductionResponse, ts time.Time) []*influxdb2write.Point {
 	var ps []*influxdb2write.Point
+	if prod == nil {
+		return ps
+	}
 	for _, measure := range prod.Production {
 		if measure.MeasurementType == "production" {
 			for i, line := range measure.Lines {
@@ -121,6 +125,9 @@ func extractProductionStats(prod *envoy.ProductionResponse, ts time.Time) []*inf
 }
 
 func extractInverterStats(inverters *[]envoy.Inverter, ts time.Time) []*influxdb2write.Point {
+	if inverters == nil {
+		return make([]*influxdb2write.Point, 0)
+	}
 	ps := make([]*influxdb2write.Point, len(*inverters))
 	for i, inv := range *inverters {
 		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("inverter-production-%s", inv.SerialNumber)).
@@ -136,6 +143,9 @@ func extractInverterStats(inverters *[]envoy.Inverter, ts time.Time) []*influxdb
 }
 
 func extractBatteryStats(batteries *[]envoy.Battery, ts time.Time) []*influxdb2write.Point {
+	if batteries == nil {
+		return make([]*influxdb2write.Point, 0)
+	}
 	bats := make([]*influxdb2write.Point, len(*batteries))
 	for i, inv := range *batteries {
 		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("battery-%s", inv.SerialNum)).
@@ -151,8 +161,7 @@ func extractBatteryStats(batteries *[]envoy.Battery, ts time.Time) []*influxdb2w
 }
 
 // scrape function now takes EnvoyClientInterface
-func scrape(e EnvoyClientInterface, influxWriter influxdb2write.WriteAPI, scrapeTime time.Time) (numPoints int, clientInvalidated bool) {
-	// scrapeTime is now passed as an argument
+func scrape(e EnvoyClientInterface, influxWriter influxdb2api.WriteAPIBlocking, scrapeTime time.Time) (numPoints int, clientInvalidated bool) {
 	clientInvalidated = false // Ensure initialized
 	cr, err := e.CommCheck()
 	if err != nil {
@@ -208,7 +217,7 @@ func scrape(e EnvoyClientInterface, influxWriter influxdb2write.WriteAPI, scrape
 	return len(points), clientInvalidated
 }
 
-func scrapeLoop(influxWriter influxdb2write.WriteAPI) {
+func scrapeLoop(influxWriter influxdb2api.WriteAPIBlocking) {
 	log.Infof("Connecting to envoy at: %s", cfg.Address)
 	connected := false
 	var err error
@@ -244,7 +253,7 @@ func scrapeLoop(influxWriter influxdb2write.WriteAPI) {
 			connected = false // Trigger reconnection
 			// Potentially add a small delay before retrying connection immediately
 			time.Sleep(time.Second * 1) // Brief pause before trying to reconnect
-			continue                  // Jump to the start of the loop to reconnect
+			continue                    // Jump to the start of the loop to reconnect
 		}
 
 		timeToSleep := time.Until(tStat.Add(interval))

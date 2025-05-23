@@ -1,18 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
+	influxdatalp "github.com/influxdata/line-protocol"
 	envoy "github.com/loafoe/go-envoy"
 )
 
 // Helper to find a tag in a list of tags
-func findTag(tags []*influxdb2write.Tag, key string) *influxdb2write.Tag {
+func findTag(tags []*influxdatalp.Tag, key string) *influxdatalp.Tag {
 	for _, tag := range tags {
 		if tag.Key == key {
 			return tag
@@ -22,7 +26,7 @@ func findTag(tags []*influxdb2write.Tag, key string) *influxdb2write.Tag {
 }
 
 // Helper to find a field in a list of fields
-func findField(fields []*influxdb2write.Field, key string) *influxdb2write.Field {
+func findField(fields []*influxdatalp.Field, key string) *influxdatalp.Field {
 	for _, field := range fields {
 		if field.Key == key {
 			return field
@@ -83,10 +87,6 @@ func comparePoints(t *testing.T, expected, actual *influxdb2write.Point, checkTi
 		}
 	}
 }
-
-func TestScrape(t *testing.T) {
-	cfg.SourceTag = "test-source" // Consistent source tag for tests
-	fixedTime := time.Now().Truncate(time.Second)
 
 // Helper to create temporary config files:
 func createTempConfigFile(t *testing.T, content string) string {
@@ -204,25 +204,25 @@ source: "test-source-from-file"
 		},
 		{
 			name:          "Missing InfluxDB",
-			fileContent:   validBaseConfig + "influxdb: \"\"\n",
+			fileContent:   strings.Replace(validBaseConfig, `influxdb: "http://localhost:8086"`, "influxdb: \"\"\n", 1),
 			expectError:   true,
 			errorContains: "Missing required configuration: influxdb",
 		},
 		{
 			name:          "Missing InfluxDBToken",
-			fileContent:   validBaseConfig + "influxdb_token: \"\"\n",
+			fileContent:   strings.Replace(validBaseConfig, `influxdb_token: "token"`, "influxdb_token: \"\"", 1),
 			expectError:   true,
 			errorContains: "Missing required configuration: influxdb_token",
 		},
 		{
 			name:          "Missing InfluxDBOrg",
-			fileContent:   validBaseConfig + "influxdb_org: \"\"\n",
+			fileContent:   strings.Replace(validBaseConfig, `influxdb_org: "org"`, "influxdb_org: \"\"", 1),
 			expectError:   true,
 			errorContains: "Missing required configuration: influxdb_org",
 		},
 		{
 			name:          "Missing InfluxDBBucket",
-			fileContent:   validBaseConfig + "influxdb_bucket: \"\"\n",
+			fileContent:   strings.Replace(validBaseConfig, `influxdb_bucket: "bucket"`, "influxdb_bucket: \"\"", 1),
 			expectError:   true,
 			errorContains: "Missing required configuration: influxdb_bucket",
 		},
@@ -281,12 +281,17 @@ source: "test-source-from-file"
 }
 
 // Default mock implementations
-func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
-		return &[]envoy.CommCheckDevice{{Sn: "dev1"}}, nil
-	}
+func defaultCommCheck() (*envoy.CommCheckResponse, error) {
+	return &envoy.CommCheckResponse{"device": 0}, nil
+}
+
+func TestProuctionScrape(t *testing.T) {
+	cfg.SourceTag = "test-source" // Consistent source tag for tests
+	fixedTime := time.Now().Truncate(time.Second)
+
 	defaultProduction := func() (*envoy.ProductionResponse, error) {
 		return &envoy.ProductionResponse{
-			Production: []envoy.TotalMeasurement{{MeasurementType: "production", Lines: []envoy.Line{{WNow: 100}}}},
+			Production: []envoy.Measurement{{MeasurementType: "production", Lines: []envoy.Line{{WNow: 100}}}},
 		}, nil
 	}
 	defaultInverters := func() (*[]envoy.Inverter, error) {
@@ -297,14 +302,14 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 	}
 
 	tests := []struct {
-		name                    string
-		setupMockEnvoy          func(*MockEnvoyClient)
-		setupMockInflux         func(*MockInfluxWriter)
-		expectedNumPoints       int
+		name                      string
+		setupMockEnvoy            func(*MockEnvoyClient)
+		setupMockInflux           func(*MockInfluxWriter)
+		expectedNumPoints         int
 		expectedClientInvalidated bool
-		expectedPointsWritten   int
-		checkInvalidateCalled   bool
-		expectedInvalidateCalled bool
+		expectedPointsWritten     int
+		checkInvalidateCalled     bool
+		expectedInvalidateCalled  bool
 	}{
 		{
 			name: "Success Case - All data fetched and written",
@@ -317,16 +322,16 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 			setupMockInflux: func(miw *MockInfluxWriter) {
 				miw.WritePointError = nil
 			},
-			expectedNumPoints:       3, // 1 production, 1 inverter, 1 battery
+			expectedNumPoints:         3, // 1 production, 1 inverter, 1 battery
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   3,
-			checkInvalidateCalled:   true,
-			expectedInvalidateCalled: false,
+			expectedPointsWritten:     3,
+			checkInvalidateCalled:     true,
+			expectedInvalidateCalled:  false,
 		},
 		{
 			name: "CommCheck Failure",
 			setupMockEnvoy: func(mec *MockEnvoyClient) {
-				mec.CommCheckFunc = func() (*[]envoy.CommCheckDevice, error) {
+				mec.CommCheckFunc = func() (*envoy.CommCheckResponse, error) {
 					return nil, fmt.Errorf("CommCheck error")
 				}
 				// Production, Inverters, Batteries should not be called
@@ -335,12 +340,12 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 					return nil, nil
 				}
 			},
-			setupMockInflux: func(miw *MockInfluxWriter) {},
-			expectedNumPoints:       0,
+			setupMockInflux:           func(miw *MockInfluxWriter) {},
+			expectedNumPoints:         0,
 			expectedClientInvalidated: true,
-			expectedPointsWritten:   0,
-			checkInvalidateCalled:   true,
-			expectedInvalidateCalled: true,
+			expectedPointsWritten:     0,
+			checkInvalidateCalled:     true,
+			expectedInvalidateCalled:  true,
 		},
 		{
 			name: "Production Data Fetch Failure",
@@ -352,12 +357,12 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 				mec.InvertersFunc = defaultInverters // Inverters should still be called
 				mec.BatteriesFunc = defaultBatteries // Batteries should still be called
 			},
-			setupMockInflux: func(miw *MockInfluxWriter) {},
-			expectedNumPoints:       2, // 1 inverter, 1 battery
+			setupMockInflux:           func(miw *MockInfluxWriter) {},
+			expectedNumPoints:         2, // 1 inverter, 1 battery
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   2,
-			checkInvalidateCalled:   true,
-			expectedInvalidateCalled: false,
+			expectedPointsWritten:     2,
+			checkInvalidateCalled:     true,
+			expectedInvalidateCalled:  false,
 		},
 		{
 			name: "All Data Fetch Failures (CommCheck success)",
@@ -367,27 +372,27 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 				mec.InvertersFunc = func() (*[]envoy.Inverter, error) { return nil, fmt.Errorf("Inv error") }
 				mec.BatteriesFunc = func() (*[]envoy.Battery, error) { return nil, fmt.Errorf("Bat error") }
 			},
-			setupMockInflux: func(miw *MockInfluxWriter) {},
-			expectedNumPoints:       0,
+			setupMockInflux:           func(miw *MockInfluxWriter) {},
+			expectedNumPoints:         0,
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   0,
-			checkInvalidateCalled:   true,
-			expectedInvalidateCalled: false,
+			expectedPointsWritten:     0,
+			checkInvalidateCalled:     true,
+			expectedInvalidateCalled:  false,
 		},
 		{
 			name: "No Data Found (Successful Fetch, Empty Results)",
 			setupMockEnvoy: func(mec *MockEnvoyClient) {
 				mec.CommCheckFunc = defaultCommCheck
 				mec.ProductionFunc = func() (*envoy.ProductionResponse, error) { return &envoy.ProductionResponse{}, nil } // Empty
-				mec.InvertersFunc = func() (*[]envoy.Inverter, error) { return &[]envoy.Inverter{}, nil }         // Empty
-				mec.BatteriesFunc = func() (*[]envoy.Battery, error) { return &[]envoy.Battery{}, nil }           // Empty
+				mec.InvertersFunc = func() (*[]envoy.Inverter, error) { return &[]envoy.Inverter{}, nil }                  // Empty
+				mec.BatteriesFunc = func() (*[]envoy.Battery, error) { return &[]envoy.Battery{}, nil }                    // Empty
 			},
-			setupMockInflux: func(miw *MockInfluxWriter) {},
-			expectedNumPoints:       0,
+			setupMockInflux:           func(miw *MockInfluxWriter) {},
+			expectedNumPoints:         0,
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   0,
-			checkInvalidateCalled:   true,
-			expectedInvalidateCalled: false,
+			expectedPointsWritten:     0,
+			checkInvalidateCalled:     true,
+			expectedInvalidateCalled:  false,
 		},
 		{
 			name: "InfluxDB WritePoint Failure",
@@ -400,11 +405,11 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 			setupMockInflux: func(miw *MockInfluxWriter) {
 				miw.WritePointError = fmt.Errorf("InfluxDB write error")
 			},
-			expectedNumPoints:       3, // Points are collected
+			expectedNumPoints:         3, // Points are collected
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   3, // WritePoint is attempted
-			checkInvalidateCalled:   true,
-			expectedInvalidateCalled: false,
+			expectedPointsWritten:     3, // WritePoint is attempted
+			checkInvalidateCalled:     true,
+			expectedInvalidateCalled:  false,
 		},
 		{
 			name: "Partial Data (Only Production Available)",
@@ -414,12 +419,12 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 				mec.InvertersFunc = func() (*[]envoy.Inverter, error) { return nil, fmt.Errorf("Inverter error") }
 				mec.BatteriesFunc = func() (*[]envoy.Battery, error) { return &[]envoy.Battery{}, nil } // Empty batteries
 			},
-			setupMockInflux: func(miw *MockInfluxWriter) {},
-			expectedNumPoints:       1, // Only 1 production point
+			setupMockInflux:           func(miw *MockInfluxWriter) {},
+			expectedNumPoints:         1, // Only 1 production point
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   1,
-			checkInvalidateCalled:   true,
-			expectedInvalidateCalled: false,
+			expectedPointsWritten:     1,
+			checkInvalidateCalled:     true,
+			expectedInvalidateCalled:  false,
 		},
 		{
 			name: "Production data has nil lines",
@@ -427,16 +432,16 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 				mec.CommCheckFunc = defaultCommCheck
 				mec.ProductionFunc = func() (*envoy.ProductionResponse, error) {
 					return &envoy.ProductionResponse{
-						Production: []envoy.TotalMeasurement{{MeasurementType: "production", Lines: nil}}, // Nil lines
+						Production: []envoy.Measurement{{MeasurementType: "production", Lines: nil}}, // Nil lines
 					}, nil
 				}
 				mec.InvertersFunc = defaultInverters
 				mec.BatteriesFunc = defaultBatteries
 			},
-			setupMockInflux: func(miw *MockInfluxWriter) {},
-			expectedNumPoints:       2, // Inverter + Battery
+			setupMockInflux:           func(miw *MockInfluxWriter) {},
+			expectedNumPoints:         2, // Inverter + Battery
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   2,
+			expectedPointsWritten:     2,
 		},
 		{
 			name: "Production data has empty lines",
@@ -444,16 +449,16 @@ func defaultCommCheck() (*[]envoy.CommCheckDevice, error) {
 				mec.CommCheckFunc = defaultCommCheck
 				mec.ProductionFunc = func() (*envoy.ProductionResponse, error) {
 					return &envoy.ProductionResponse{
-						Production: []envoy.TotalMeasurement{{MeasurementType: "production", Lines: []envoy.Line{}}}, // Empty lines
+						Production: []envoy.Measurement{{MeasurementType: "production", Lines: []envoy.Line{}}}, // Empty lines
 					}, nil
 				}
 				mec.InvertersFunc = defaultInverters
 				mec.BatteriesFunc = defaultBatteries
 			},
-			setupMockInflux: func(miw *MockInfluxWriter) {},
-			expectedNumPoints:       2, // Inverter + Battery
+			setupMockInflux:           func(miw *MockInfluxWriter) {},
+			expectedNumPoints:         2, // Inverter + Battery
 			expectedClientInvalidated: false,
-			expectedPointsWritten:   2,
+			expectedPointsWritten:     2,
 		},
 	}
 
@@ -503,10 +508,10 @@ func TestExtractBatteryStats(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 
 	tests := []struct {
-		name        string
-		batteries   *[]envoy.Battery
-		ts          time.Time
-		expectedLen int
+		name           string
+		batteries      *[]envoy.Battery
+		ts             time.Time
+		expectedLen    int
 		expectedPoints []struct {
 			name   string
 			tags   map[string]string
@@ -563,18 +568,18 @@ func TestExtractBatteryStats(t *testing.T) {
 				fields map[string]interface{}
 			}{
 				{
-					name: "battery-bat789",
-					tags: map[string]string{"serial": "bat789"},
+					name:   "battery-bat789",
+					tags:   map[string]string{"serial": "bat789"},
 					fields: map[string]interface{}{"percent-full": 88, "temperature": 25},
 				},
 				{
-					name: "battery-bat123",
-					tags: map[string]string{"serial": "bat123"},
+					name:   "battery-bat123",
+					tags:   map[string]string{"serial": "bat123"},
 					fields: map[string]interface{}{"percent-full": 50, "temperature": 22},
 				},
 				{
-					name: "battery-bat456",
-					tags: map[string]string{"serial": "bat456"},
+					name:   "battery-bat456",
+					tags:   map[string]string{"serial": "bat456"},
 					fields: map[string]interface{}{"percent-full": 100, "temperature": 28},
 				},
 			},
@@ -621,10 +626,10 @@ func TestExtractInverterStats(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 
 	tests := []struct {
-		name        string
-		inverters   *[]envoy.Inverter
-		ts          time.Time
-		expectedLen int
+		name           string
+		inverters      *[]envoy.Inverter
+		ts             time.Time
+		expectedLen    int
 		expectedPoints []struct {
 			name   string
 			tags   map[string]string
@@ -681,18 +686,18 @@ func TestExtractInverterStats(t *testing.T) {
 				fields map[string]interface{}
 			}{
 				{
-					name: "inverter-production-inv123",
-					tags: map[string]string{"serial": "inv123"},
+					name:   "inverter-production-inv123",
+					tags:   map[string]string{"serial": "inv123"},
 					fields: map[string]interface{}{"P": 250},
 				},
 				{
-					name: "inverter-production-inv456",
-					tags: map[string]string{"serial": "inv456"},
+					name:   "inverter-production-inv456",
+					tags:   map[string]string{"serial": "inv456"},
 					fields: map[string]interface{}{"P": 300},
 				},
 				{
-					name: "inverter-production-inv789",
-					tags: map[string]string{"serial": "inv789"},
+					name:   "inverter-production-inv789",
+					tags:   map[string]string{"serial": "inv789"},
 					fields: map[string]interface{}{"P": 0},
 				},
 			},
@@ -744,7 +749,7 @@ func TestExtractProductionStats(t *testing.T) {
 		prod          *envoy.ProductionResponse
 		ts            time.Time
 		expectedLen   int
-		expectedNames []string // For verifying a subset of generated points
+		expectedNames []string          // For verifying a subset of generated points
 		expectedTags  map[string]string // Common tags to check for the first point if any
 	}{
 		{
@@ -756,8 +761,8 @@ func TestExtractProductionStats(t *testing.T) {
 		{
 			name: "Empty ProductionResponse",
 			prod: &envoy.ProductionResponse{
-				Production:  []envoy.TotalMeasurement{},
-				Consumption: []envoy.TotalMeasurement{},
+				Production:  []envoy.Measurement{},
+				Consumption: []envoy.Measurement{},
 			},
 			ts:          now,
 			expectedLen: 0,
@@ -765,7 +770,7 @@ func TestExtractProductionStats(t *testing.T) {
 		{
 			name: "Production, Total Consumption, Net Consumption",
 			prod: &envoy.ProductionResponse{
-				Production: []envoy.TotalMeasurement{
+				Production: []envoy.Measurement{
 					{
 						MeasurementType: "production",
 						Lines: []envoy.Line{
@@ -773,7 +778,7 @@ func TestExtractProductionStats(t *testing.T) {
 						},
 					},
 				},
-				Consumption: []envoy.TotalMeasurement{
+				Consumption: []envoy.Measurement{
 					{
 						MeasurementType: "total-consumption",
 						Lines: []envoy.Line{
@@ -799,7 +804,7 @@ func TestExtractProductionStats(t *testing.T) {
 		{
 			name: "Only production data",
 			prod: &envoy.ProductionResponse{
-				Production: []envoy.TotalMeasurement{
+				Production: []envoy.Measurement{
 					{
 						MeasurementType: "production",
 						Lines: []envoy.Line{
@@ -808,7 +813,7 @@ func TestExtractProductionStats(t *testing.T) {
 						},
 					},
 				},
-				Consumption: []envoy.TotalMeasurement{},
+				Consumption: []envoy.Measurement{},
 			},
 			ts:            now,
 			expectedLen:   2,
@@ -817,7 +822,7 @@ func TestExtractProductionStats(t *testing.T) {
 		{
 			name: "Unexpected MeasurementType",
 			prod: &envoy.ProductionResponse{
-				Production: []envoy.TotalMeasurement{
+				Production: []envoy.Measurement{
 					{
 						MeasurementType: "unknown-type", // This should be skipped
 						Lines: []envoy.Line{
@@ -825,7 +830,7 @@ func TestExtractProductionStats(t *testing.T) {
 						},
 					},
 				},
-				Consumption: []envoy.TotalMeasurement{
+				Consumption: []envoy.Measurement{
 					{
 						MeasurementType: "total-consumption",
 						Lines: []envoy.Line{
@@ -841,13 +846,13 @@ func TestExtractProductionStats(t *testing.T) {
 		{
 			name: "Production with no lines",
 			prod: &envoy.ProductionResponse{
-				Production: []envoy.TotalMeasurement{
+				Production: []envoy.Measurement{
 					{
 						MeasurementType: "production",
 						Lines:           []envoy.Line{}, // Empty lines
 					},
 				},
-				Consumption: []envoy.TotalMeasurement{
+				Consumption: []envoy.Measurement{
 					{
 						MeasurementType: "total-consumption",
 						Lines: []envoy.Line{
@@ -903,13 +908,9 @@ func TestExtractProductionStats(t *testing.T) {
 	}
 }
 
-func TestLineToPoint(t *testing.T) {
-	cfg.SourceTag = "test-source" // Set a dummy source tag for testing
-	now := time.Now().Truncate(time.Second) // Truncate for consistent comparison
-
 // MockEnvoyClient implements EnvoyClientInterface for testing
 type MockEnvoyClient struct {
-	CommCheckFunc           func() (*[]envoy.CommCheckDevice, error)
+	CommCheckFunc           func() (*envoy.CommCheckResponse, error)
 	ProductionFunc          func() (*envoy.ProductionResponse, error)
 	InvertersFunc           func() (*[]envoy.Inverter, error)
 	BatteriesFunc           func() (*[]envoy.Battery, error)
@@ -917,12 +918,12 @@ type MockEnvoyClient struct {
 	invalidateSessionCalled bool
 }
 
-func (m *MockEnvoyClient) CommCheck() (*[]envoy.CommCheckDevice, error) {
+func (m *MockEnvoyClient) CommCheck() (*envoy.CommCheckResponse, error) {
 	if m.CommCheckFunc != nil {
 		return m.CommCheckFunc()
 	}
 	// Default behavior
-	return &[]envoy.CommCheckDevice{}, nil
+	return &envoy.CommCheckResponse{}, nil
 }
 
 func (m *MockEnvoyClient) Production() (*envoy.ProductionResponse, error) {
@@ -968,6 +969,14 @@ func (m *MockInfluxWriter) WritePoint(ctx context.Context, point ...*influxdb2wr
 	return m.WritePointError
 }
 
+func (m *MockInfluxWriter) EnableBatching() {
+	return
+}
+
+func (w *MockInfluxWriter) WriteRecord(ctx context.Context, line ...string) error {
+	return nil
+}
+
 func (m *MockInfluxWriter) Flush(ctx context.Context) error {
 	// No-op for testing, unless specific flush behavior is needed
 	return nil
@@ -989,6 +998,10 @@ func newMockInfluxWriter() *MockInfluxWriter {
 		PointsWritten: make([]*influxdb2write.Point, 0), // Ensure it's empty
 	}
 }
+
+func TestLineToPoint(t *testing.T) {
+	cfg.SourceTag = "test-source"           // Set a dummy source tag for testing
+	now := time.Now().Truncate(time.Second) // Truncate for consistent comparison
 
 	tests := []struct {
 		name       string
@@ -1079,7 +1092,6 @@ func newMockInfluxWriter() *MockInfluxWriter {
 			if len(got.TagList()) != len(tt.wantTags) {
 				t.Errorf("lineToPoint() unexpected tags. Got %d, want %d. Got: %v", len(got.TagList()), len(tt.wantTags), got.TagList())
 			}
-
 
 			for key, wantValue := range tt.wantFields {
 				actualField := findField(got.FieldList(), key)
