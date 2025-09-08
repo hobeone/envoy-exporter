@@ -96,14 +96,14 @@ func extractBatteryStats(batteries *[]envoy.Battery) []*influxdb2write.Point {
 	return bats
 }
 
-func scrape(e *envoy.Client) int {
-	cr, err := e.CommCheck()
-	if err != nil {
-		e.InvalidateSession() // Token expired?
-	}
-	if cr != nil {
-		log.Infof("Found devices: %d", len(*cr))
-	}
+type EnvoyClient interface {
+	Production() (*envoy.ProductionResponse, error)
+	Inverters() (*[]envoy.Inverter, error)
+	Batteries() (*[]envoy.Battery, error)
+	InvalidateSession()
+}
+
+func scrape(e EnvoyClient) int {
 	prod, err := e.Production()
 	if err != nil {
 		log.Errorf("Error getting Production data from Envoy: %v", err)
@@ -123,7 +123,7 @@ func scrape(e *envoy.Client) int {
 	batteries, err := e.Batteries()
 	if err != nil {
 		log.Errorf("Error getting Battery data from Envoy: %v", err)
-	} else {
+	} else if batteries != nil {
 		points = append(points, extractBatteryStats(batteries)...)
 	}
 	client := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
@@ -139,7 +139,7 @@ func scrapeLoop() {
 	log.Infof("Connecting to envoy at: %s", cfg.Address)
 	connected := false
 	var err error
-	e := &envoy.Client{}
+	var e EnvoyClient
 	interval := time.Duration(cfg.Interval) * time.Second
 	for !connected {
 		e, err = envoy.NewClient(cfg.Username,
