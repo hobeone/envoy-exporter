@@ -40,6 +40,31 @@ type Config struct {
 	Interval       int    `yaml:"interval" validate:"required"`
 }
 
+func (c *Config) Validate() error {
+	if c.Address == "" {
+		return fmt.Errorf("missing required configuration: address")
+	}
+	if c.SerialNumber == "" {
+		return fmt.Errorf("missing required configuration: serial")
+	}
+	if (c.Username == "" && c.Password == "") && c.JWT == "" {
+		return fmt.Errorf("missing Envoy authentication. Add username & password and optionally the JWT token")
+	}
+	if c.InfluxDB == "" {
+		return fmt.Errorf("missing required configuration: influxdb")
+	}
+	if c.InfluxDBBucket == "" {
+		return fmt.Errorf("missing required configuration: influxdb_bucket")
+	}
+	if c.InfluxDBToken == "" {
+		return fmt.Errorf("missing required configuration: influxdb_token")
+	}
+	if c.InfluxDBOrg == "" {
+		return fmt.Errorf("missing required configuration: influxdb_org")
+	}
+	return nil
+}
+
 func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string) *influxdb2write.Point {
 	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", lineType, idx)).
 		AddTag("source", sourceTag).
@@ -250,29 +275,10 @@ func main() {
 		FullTimestamp: true,
 	})
 
-	if cfg.Address == "" {
-		log.Fatal("Missing required configuration: address")
-	}
-	if cfg.SerialNumber == "" {
-		log.Fatal("Missing required configuration: serial")
+	if err := cfg.Validate(); err != nil {
+		log.Fatal(err)
 	}
 
-	if (cfg.Username == "" && cfg.Password == "") && cfg.JWT == "" {
-		log.Fatal("Missing Envoy authentication.  Add username & password and optionally the JWT token")
-	}
-
-	if cfg.InfluxDB == "" {
-		log.Fatal("Missing required configuration: influxdb")
-	}
-	if cfg.InfluxDBBucket == "" {
-		log.Fatal("Missing required configuration: influxdb_bucket")
-	}
-	if cfg.InfluxDBToken == "" {
-		log.Fatal("Missing required configuration: influxdb_token")
-	}
-	if cfg.InfluxDBOrg == "" {
-		log.Fatal("Missing required configuration: influxdb_org")
-	}
 	log.Infof("Built with Go version: %s\n", runtime.Version())
 	log.Debugf("Scraping envoy at: %s with serial number %s every %d seconds", cfg.Address, cfg.SerialNumber, cfg.Interval)
 	log.Debugf("Writing to Influxdb: %s, Bucket '%s'", cfg.InfluxDB, cfg.InfluxDBBucket)

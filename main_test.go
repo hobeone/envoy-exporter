@@ -57,6 +57,100 @@ func (m *MockPointWriter) WritePoint(ctx context.Context, point ...*influxdb2wri
 	return nil
 }
 
+func TestConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  Config
+		wantErr bool
+	}{
+		{
+			name: "Valid Config",
+			config: Config{
+				Address:        "http://localhost",
+				SerialNumber:   "12345",
+				Username:       "user",
+				InfluxDB:       "http://influx",
+				InfluxDBBucket: "bucket",
+				InfluxDBToken:  "token",
+				InfluxDBOrg:    "org",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Valid Config with JWT",
+			config: Config{
+				Address:        "http://localhost",
+				SerialNumber:   "12345",
+				JWT:            "token",
+				InfluxDB:       "http://influx",
+				InfluxDBBucket: "bucket",
+				InfluxDBToken:  "token",
+				InfluxDBOrg:    "org",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Missing Address",
+			config: Config{
+				SerialNumber:   "12345",
+				Username:       "user",
+				InfluxDB:       "http://influx",
+				InfluxDBBucket: "bucket",
+				InfluxDBToken:  "token",
+				InfluxDBOrg:    "org",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Missing Serial",
+			config: Config{
+				Address:        "http://localhost",
+				Username:       "user",
+				InfluxDB:       "http://influx",
+				InfluxDBBucket: "bucket",
+				InfluxDBToken:  "token",
+				InfluxDBOrg:    "org",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Missing Authentication",
+			config: Config{
+				Address:        "http://localhost",
+				SerialNumber:   "12345",
+				InfluxDB:       "http://influx",
+				InfluxDBBucket: "bucket",
+				InfluxDBToken:  "token",
+				InfluxDBOrg:    "org",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Missing InfluxDB",
+			config: Config{
+				Address:        "http://localhost",
+				SerialNumber:   "12345",
+				Username:       "user",
+				InfluxDBBucket: "bucket",
+				InfluxDBToken:  "token",
+				InfluxDBOrg:    "org",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestLineToPoint(t *testing.T) {
 	line := envoy.Line{
 		WNow:       100,
