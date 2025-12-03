@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
 
+	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
 	envoy "github.com/loafoe/go-envoy"
 	"github.com/stretchr/testify/assert"
 )
@@ -44,8 +46,18 @@ func (m *MockEnvoyClient) InvalidateSession() {
 	}
 }
 
+type MockPointWriter struct {
+	WritePointFunc func(ctx context.Context, point ...*influxdb2write.Point) error
+}
+
+func (m *MockPointWriter) WritePoint(ctx context.Context, point ...*influxdb2write.Point) error {
+	if m.WritePointFunc != nil {
+		return m.WritePointFunc(ctx, point...)
+	}
+	return nil
+}
+
 func TestLineToPoint(t *testing.T) {
-	cfg.SourceTag = "test"
 	line := envoy.Line{
 		WNow:       100,
 		ReactPwr:   200,
@@ -53,7 +65,7 @@ func TestLineToPoint(t *testing.T) {
 		RmsCurrent: 400,
 		RmsVoltage: 500,
 	}
-	point := lineToPoint("test-type", line, 1)
+	point := lineToPoint("test-type", line, 1, "test")
 	assert.NotNil(t, point)
 	assert.Equal(t, "test-type-line1", point.Name())
 
@@ -81,7 +93,6 @@ func TestLineToPoint(t *testing.T) {
 }
 
 func TestExtractProductionStats(t *testing.T) {
-	cfg.SourceTag = "test"
 	prod := &envoy.ProductionResponse{
 		Production: []envoy.Measurement{
 			{
@@ -106,7 +117,7 @@ func TestExtractProductionStats(t *testing.T) {
 			},
 		},
 	}
-	points := extractProductionStats(prod)
+	points := extractProductionStats(prod, "test")
 	assert.Len(t, points, 3)
 	assert.Equal(t, "production-line0", points[0].Name())
 	assert.Equal(t, "consumption-line0", points[1].Name())
@@ -114,14 +125,13 @@ func TestExtractProductionStats(t *testing.T) {
 }
 
 func TestExtractInverterStats(t *testing.T) {
-	cfg.SourceTag = "test"
 	inverters := &[]envoy.Inverter{
 		{
 			SerialNumber:    "123",
 			LastReportWatts: 100,
 		},
 	}
-	points := extractInverterStats(inverters)
+	points := extractInverterStats(inverters, "test")
 	assert.Len(t, points, 1)
 	assert.Equal(t, "inverter-production-123", points[0].Name())
 
@@ -145,7 +155,6 @@ func TestExtractInverterStats(t *testing.T) {
 }
 
 func TestExtractBatteryStats(t *testing.T) {
-	cfg.SourceTag = "test"
 	batteries := &[]envoy.Battery{
 		{
 			SerialNum:   "456",
@@ -153,7 +162,7 @@ func TestExtractBatteryStats(t *testing.T) {
 			Temperature: 25,
 		},
 	}
-	points := extractBatteryStats(batteries)
+	points := extractBatteryStats(batteries, "test")
 	assert.Len(t, points, 1)
 	assert.Equal(t, "battery-456", points[0].Name())
 
@@ -178,16 +187,12 @@ func TestExtractBatteryStats(t *testing.T) {
 }
 
 func TestScrape(t *testing.T) {
-	cfg.SourceTag = "test"
-	cfg.InfluxDB = "http://localhost:8086"
-	cfg.InfluxDBToken = "test-token"
-	cfg.InfluxDBOrg = "test-org"
-	cfg.InfluxDBBucket = "test-bucket"
-
+	mockWriter := &MockPointWriter{}
+	
 	tests := []struct {
 		name          string
 		mockClient    *MockEnvoyClient
-		expectedError bool
+		expectedPoints int
 	}{
 		{
 			name: "successful scrape",
@@ -216,7 +221,7 @@ func TestScrape(t *testing.T) {
 					}}, nil
 				},
 			},
-			expectedError: false,
+			expectedPoints: 3,
 		},
 		{
 			name: "production error",
@@ -225,18 +230,14 @@ func TestScrape(t *testing.T) {
 					return nil, errors.New("production error")
 				},
 			},
-			expectedError: true,
+			expectedPoints: 0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			numPoints := scrape(tt.mockClient)
-			if tt.expectedError {
-				assert.Equal(t, 0, numPoints)
-			} else {
-				assert.Equal(t, 3, numPoints)
-			}
+			numPoints := scrape(context.Background(), tt.mockClient, mockWriter, "test")
+			assert.Equal(t, tt.expectedPoints, numPoints)
 		})
 	}
 }

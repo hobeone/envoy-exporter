@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -24,14 +26,23 @@ import (
 	envoy "github.com/loafoe/go-envoy"
 )
 
-var (
-	cfgFile string
-	cfg     Config
-)
+type Config struct {
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	JWT            string `yaml:"jwt"`
+	Address        string `yaml:"address"`
+	SerialNumber   string `yaml:"serial"`
+	SourceTag      string `yaml:"source"`
+	InfluxDB       string `yaml:"influxdb"`
+	InfluxDBToken  string `yaml:"influxdb_token"`
+	InfluxDBOrg    string `yaml:"influxdb_org"`
+	InfluxDBBucket string `yaml:"influxdb_bucket"`
+	Interval       int    `yaml:"interval" validate:"required"`
+}
 
-func lineToPoint(lineType string, line envoy.Line, idx int) *influxdb2write.Point {
+func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string) *influxdb2write.Point {
 	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", lineType, idx)).
-		AddTag("source", cfg.SourceTag).
+		AddTag("source", sourceTag).
 		AddTag("measurement-type", lineType).
 		AddTag("line-idx", fmt.Sprintf("%d", idx)).
 		AddField("P", line.WNow).
@@ -42,35 +53,35 @@ func lineToPoint(lineType string, line envoy.Line, idx int) *influxdb2write.Poin
 		SetTime(time.Now())
 }
 
-func extractProductionStats(prod *envoy.ProductionResponse) []*influxdb2write.Point {
+func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string) []*influxdb2write.Point {
 	var ps []*influxdb2write.Point
 	for _, measure := range prod.Production {
 		if measure.MeasurementType == "production" {
 			for i, line := range measure.Lines {
-				ps = append(ps, lineToPoint("production", line, i))
+				ps = append(ps, lineToPoint("production", line, i, sourceTag))
 			}
 		}
 	}
 	for _, measure := range prod.Consumption {
 		if measure.MeasurementType == "total-consumption" {
 			for i, line := range measure.Lines {
-				ps = append(ps, lineToPoint("consumption", line, i))
+				ps = append(ps, lineToPoint("consumption", line, i, sourceTag))
 			}
 		}
 		if measure.MeasurementType == "net-consumption" {
 			for i, line := range measure.Lines {
-				ps = append(ps, lineToPoint("net", line, i))
+				ps = append(ps, lineToPoint("net", line, i, sourceTag))
 			}
 		}
 	}
 	return ps
 }
 
-func extractInverterStats(inverters *[]envoy.Inverter) []*influxdb2write.Point {
+func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string) []*influxdb2write.Point {
 	ps := make([]*influxdb2write.Point, len(*inverters))
 	for i, inv := range *inverters {
 		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("inverter-production-%s", inv.SerialNumber)).
-			AddTag("source", cfg.SourceTag).
+			AddTag("source", sourceTag).
 			AddTag("measurement-type", "inverter").
 			AddTag("serial", inv.SerialNumber).
 			AddField("P", inv.LastReportWatts).
@@ -81,11 +92,11 @@ func extractInverterStats(inverters *[]envoy.Inverter) []*influxdb2write.Point {
 	return ps
 }
 
-func extractBatteryStats(batteries *[]envoy.Battery) []*influxdb2write.Point {
+func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string) []*influxdb2write.Point {
 	bats := make([]*influxdb2write.Point, len(*batteries))
 	for i, inv := range *batteries {
 		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("battery-%s", inv.SerialNum)).
-			AddTag("source", cfg.SourceTag).
+			AddTag("source", sourceTag).
 			AddTag("measurement-type", "battery").
 			AddTag("serial", inv.SerialNum).
 			AddField("percent-full", inv.PercentFull).
@@ -103,92 +114,125 @@ type EnvoyClient interface {
 	InvalidateSession()
 }
 
-func scrape(e EnvoyClient) int {
+// PointWriter abstracts the InfluxDB WriteAPIBlocking
+type PointWriter interface {
+	WritePoint(ctx context.Context, point ...*influxdb2write.Point) error
+}
+
+func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag string) int {
 	prod, err := e.Production()
 	if err != nil {
 		log.Errorf("Error getting Production data from Envoy: %v", err)
 	}
 	var points []*influxdb2write.Point
 	if prod != nil && len(prod.Production) > 0 {
-		points = append(points, extractProductionStats(prod)...)
+		points = append(points, extractProductionStats(prod, sourceTag)...)
 	}
 	inverters, err := e.Inverters()
 	if err != nil {
 		log.Errorf("Error getting Inverter data from Envoy: %v", err)
 	}
 	if inverters != nil && len(*inverters) > 0 {
-		points = append(points, extractInverterStats(inverters)...)
+		points = append(points, extractInverterStats(inverters, sourceTag)...)
 	}
 
 	batteries, err := e.Batteries()
 	if err != nil {
 		log.Errorf("Error getting Battery data from Envoy: %v", err)
 	} else if batteries != nil {
-		points = append(points, extractBatteryStats(batteries)...)
+		points = append(points, extractBatteryStats(batteries, sourceTag)...)
 	}
-	client := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
-	writeAPI := client.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
-	err = writeAPI.WritePoint(context.Background(), points...)
-	if err != nil {
-		log.Errorf("Error writing data to InfluxDB: %v", err)
+
+	if len(points) > 0 {
+		err = writeAPI.WritePoint(ctx, points...)
+		if err != nil {
+			log.Errorf("Error writing data to InfluxDB: %v", err)
+		}
 	}
 	return len(points)
 }
 
-func scrapeLoop() {
+func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter) {
 	log.Infof("Connecting to envoy at: %s", cfg.Address)
-	connected := false
-	var err error
 	var e EnvoyClient
-	interval := time.Duration(cfg.Interval) * time.Second
-	for !connected {
-		e, err = envoy.NewClient(cfg.Username,
-			cfg.Password,
-			cfg.SerialNumber,
-			envoy.WithGatewayAddress(cfg.Address),
-			envoy.WithDebug(true),
-			envoy.WithJWT(cfg.JWT))
-		if err != nil {
-			log.Error(err)
-			time.Sleep(interval)
-		} else {
-			connected = true
+	var err error
+	
+	// Initial connection loop
+	ticker := time.NewTicker(time.Duration(cfg.Interval) * time.Second)
+	defer ticker.Stop()
+
+	// Retry logic for initial connection
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			e, err = envoy.NewClient(cfg.Username,
+				cfg.Password,
+				cfg.SerialNumber,
+				envoy.WithGatewayAddress(cfg.Address),
+				envoy.WithDebug(true),
+				envoy.WithJWT(cfg.JWT))
+			if err != nil {
+				log.Error(err)
+				log.Info("Retrying connection in 5 seconds...")
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+					continue
+				}
+			}
+		}
+		break // Connected
+	}
+
+	// Main scrape loop
+	// Perform an immediate scrape first
+	scrape(ctx, e, writeAPI, cfg.SourceTag)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("Stopping scrape loop...")
+			return
+		case <-ticker.C:
+			tStat := time.Now()
+			numPoints := scrape(ctx, e, writeAPI, cfg.SourceTag)
+			scrapeDuration := time.Since(tStat)
+			log.Infof("Scrape took: %v, found %d points", scrapeDuration, numPoints)
 		}
 	}
-	for {
-		tStat := time.Now()
-		numPoints := scrape(e)
-		scrapeDuration := time.Since(tStat)
-		timeToSleep := time.Until(tStat.Add(interval))
-		log.Infof("Scrape took: %v, found %d points, sleeping %v", scrapeDuration, numPoints, timeToSleep)
-		time.Sleep(timeToSleep)
-	}
-}
-
-type Config struct {
-	Username       string `yaml:"username"`
-	Password       string `yaml:"password"`
-	JWT            string `yaml:"jwt"`
-	Address        string `yaml:"address"`
-	SerialNumber   string `yaml:"serial"`
-	SourceTag      string `yaml:"source"`
-	InfluxDB       string `yaml:"influxdb"`
-	InfluxDBToken  string `yaml:"influxdb_token"`
-	InfluxDBOrg    string `yaml:"influxdb_org"`
-	InfluxDBBucket string `yaml:"influxdb_bucket"`
-	Interval       int    `yaml:"interval" validate:"required"`
 }
 
 func main() {
+	// Setup context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle signals
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		log.Info("Received shutdown signal")
+		cancel()
+	}()
+
 	go func() {
 		// For expvar exporting to netdata
+		// TODO: Make port configurable
 		log.Println(http.ListenAndServe("localhost:6666", nil))
 	}()
 
+	var cfgFile string
 	flag.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
 	flag.Parse()
 
-	cfg.Interval = 5
+	// Default interval
+	cfg := Config{
+		Interval: 5,
+	}
 
 	log.Infof("Reading Config: %s", cfgFile)
 	f, err := os.Open(cfgFile)
@@ -230,7 +274,13 @@ func main() {
 		log.Fatal("Missing required configuration: influxdb_org")
 	}
 	log.Infof("Built with Go version: %s\n", runtime.Version())
-	log.Infof("Scraping envoy at: %s with serial number %s every %d seconds", cfg.Address, cfg.SerialNumber, cfg.Interval)
-	log.Infof("Writing to Influxdb: %s, Bucket '%s'", cfg.InfluxDB, cfg.InfluxDBBucket)
-	scrapeLoop()
+	log.Debugf("Scraping envoy at: %s with serial number %s every %d seconds", cfg.Address, cfg.SerialNumber, cfg.Interval)
+	log.Debugf("Writing to Influxdb: %s, Bucket '%s'", cfg.InfluxDB, cfg.InfluxDBBucket)
+
+	// Initialize InfluxDB Client
+	client := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
+	defer client.Close()
+	writeAPI := client.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
+
+	scrapeLoop(ctx, &cfg, writeAPI)
 }
