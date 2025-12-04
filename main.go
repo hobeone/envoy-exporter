@@ -26,6 +26,27 @@ import (
 	envoy "github.com/loafoe/go-envoy"
 )
 
+const (
+	MeasurementProduction       = "production"
+	MeasurementTotalConsumption = "total-consumption"
+	MeasurementNetConsumption   = "net-consumption"
+	MeasurementInverter         = "inverter"
+	MeasurementBattery          = "battery"
+
+	TagSource          = "source"
+	TagMeasurementType = "measurement-type"
+	TagLineIdx         = "line-idx"
+	TagSerial          = "serial"
+
+	FieldP           = "P"
+	FieldQ           = "Q"
+	FieldS           = "S"
+	FieldIrms        = "I_rms"
+	FieldVrms        = "V_rms"
+	FieldPercentFull = "percent-full"
+	FieldTemperature = "temperature"
+)
+
 type Config struct {
 	Username       string `yaml:"username"`
 	Password       string `yaml:"password"`
@@ -38,6 +59,7 @@ type Config struct {
 	InfluxDBOrg    string `yaml:"influxdb_org"`
 	InfluxDBBucket string `yaml:"influxdb_bucket"`
 	Interval       int    `yaml:"interval" validate:"required"`
+	ExpVarPort     int    `yaml:"expvar_port"`
 }
 
 func (c *Config) Validate() error {
@@ -67,33 +89,33 @@ func (c *Config) Validate() error {
 
 func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string) *influxdb2write.Point {
 	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", lineType, idx)).
-		AddTag("source", sourceTag).
-		AddTag("measurement-type", lineType).
-		AddTag("line-idx", fmt.Sprintf("%d", idx)).
-		AddField("P", line.WNow).
-		AddField("Q", line.ReactPwr).
-		AddField("S", line.ApprntPwr).
-		AddField("I_rms", line.RmsCurrent).
-		AddField("V_rms", line.RmsVoltage).
+		AddTag(TagSource, sourceTag).
+		AddTag(TagMeasurementType, lineType).
+		AddTag(TagLineIdx, fmt.Sprintf("%d", idx)).
+		AddField(FieldP, line.WNow).
+		AddField(FieldQ, line.ReactPwr).
+		AddField(FieldS, line.ApprntPwr).
+		AddField(FieldIrms, line.RmsCurrent).
+		AddField(FieldVrms, line.RmsVoltage).
 		SetTime(time.Now())
 }
 
 func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string) []*influxdb2write.Point {
 	var ps []*influxdb2write.Point
 	for _, measure := range prod.Production {
-		if measure.MeasurementType == "production" {
+		if measure.MeasurementType == MeasurementProduction {
 			for i, line := range measure.Lines {
-				ps = append(ps, lineToPoint("production", line, i, sourceTag))
+				ps = append(ps, lineToPoint(MeasurementProduction, line, i, sourceTag))
 			}
 		}
 	}
 	for _, measure := range prod.Consumption {
-		if measure.MeasurementType == "total-consumption" {
+		if measure.MeasurementType == MeasurementTotalConsumption {
 			for i, line := range measure.Lines {
 				ps = append(ps, lineToPoint("consumption", line, i, sourceTag))
 			}
 		}
-		if measure.MeasurementType == "net-consumption" {
+		if measure.MeasurementType == MeasurementNetConsumption {
 			for i, line := range measure.Lines {
 				ps = append(ps, lineToPoint("net", line, i, sourceTag))
 			}
@@ -106,10 +128,10 @@ func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string) []*infl
 	ps := make([]*influxdb2write.Point, len(*inverters))
 	for i, inv := range *inverters {
 		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("inverter-production-%s", inv.SerialNumber)).
-			AddTag("source", sourceTag).
-			AddTag("measurement-type", "inverter").
-			AddTag("serial", inv.SerialNumber).
-			AddField("P", inv.LastReportWatts).
+			AddTag(TagSource, sourceTag).
+			AddTag(TagMeasurementType, MeasurementInverter).
+			AddTag(TagSerial, inv.SerialNumber).
+			AddField(FieldP, inv.LastReportWatts).
 			SetTime(time.Now())
 		ps[i] = pt
 	}
@@ -121,11 +143,11 @@ func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string) []*influx
 	bats := make([]*influxdb2write.Point, len(*batteries))
 	for i, inv := range *batteries {
 		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("battery-%s", inv.SerialNum)).
-			AddTag("source", sourceTag).
-			AddTag("measurement-type", "battery").
-			AddTag("serial", inv.SerialNum).
-			AddField("percent-full", inv.PercentFull).
-			AddField("temperature", inv.Temperature).
+			AddTag(TagSource, sourceTag).
+			AddTag(TagMeasurementType, MeasurementBattery).
+			AddTag(TagSerial, inv.SerialNum).
+			AddField(FieldPercentFull, inv.PercentFull).
+			AddField(FieldTemperature, inv.Temperature).
 			SetTime(time.Now())
 		bats[i] = pt
 	}
@@ -244,12 +266,6 @@ func main() {
 		cancel()
 	}()
 
-	go func() {
-		// For expvar exporting to netdata
-		// TODO: Make port configurable
-		log.Println(http.ListenAndServe("localhost:6666", nil))
-	}()
-
 	var cfgFile string
 	flag.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
 	flag.Parse()
@@ -271,6 +287,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error reading config: %v", err)
 	}
+
+	go func() {
+		// For expvar exporting to netdata
+		port := cfg.ExpVarPort
+		if port == 0 {
+			port = 6666
+		}
+		log.Infof("Starting expvar server on port %d", port)
+		log.Println(http.ListenAndServe(fmt.Sprintf("localhost:%d", port), nil))
+	}()
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp: true,
 	})
