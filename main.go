@@ -47,6 +47,17 @@ const (
 	FieldTemperature = "temperature"
 )
 
+type ClientFactory func(cfg *Config) (EnvoyClient, error)
+
+func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
+	return envoy.NewClient(cfg.Username,
+		cfg.Password,
+		cfg.SerialNumber,
+		envoy.WithGatewayAddress(cfg.Address),
+		envoy.WithDebug(true),
+		envoy.WithJWT(cfg.JWT))
+}
+
 type Config struct {
 	Username       string `yaml:"username"`
 	Password       string `yaml:"password"`
@@ -85,6 +96,26 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("missing required configuration: influxdb_org")
 	}
 	return nil
+}
+
+func LoadConfig(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open config file: %w", err)
+	}
+	defer f.Close()
+
+	// Default interval
+	cfg := Config{
+		Interval: 5,
+	}
+
+	decoder := yaml.NewDecoder(f)
+	err = decoder.Decode(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config: %w", err)
+	}
+	return &cfg, nil
 }
 
 func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string) *influxdb2write.Point {
@@ -202,7 +233,7 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	return len(points)
 }
 
-func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter) {
+func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFactory ClientFactory) {
 	slog.Info("Connecting to envoy", "address", cfg.Address)
 	var e EnvoyClient
 	var err error
@@ -217,12 +248,7 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter) {
 		case <-ctx.Done():
 			return
 		default:
-			e, err = envoy.NewClient(cfg.Username,
-				cfg.Password,
-				cfg.SerialNumber,
-				envoy.WithGatewayAddress(cfg.Address),
-				envoy.WithDebug(true),
-				envoy.WithJWT(cfg.JWT))
+			e, err = clientFactory(cfg)
 			if err != nil {
 				slog.Error("Error connecting to Envoy", "error", err)
 				slog.Info("Retrying connection in 5 seconds...")
@@ -283,23 +309,10 @@ func main() {
 	flag.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
 	flag.Parse()
 
-	// Default interval
-	cfg := Config{
-		Interval: 5,
-	}
-
 	slog.Info("Reading Config", "file", cfgFile)
-	f, err := os.Open(cfgFile)
+	cfg, err := LoadConfig(cfgFile)
 	if err != nil {
-		slog.Error("Failed to open config file", "error", err)
-		os.Exit(1)
-	}
-	defer f.Close()
-
-	decoder := yaml.NewDecoder(f)
-	err = decoder.Decode(&cfg)
-	if err != nil {
-		slog.Error("Error reading config", "error", err)
+		slog.Error("Failed to load config", "error", err)
 		os.Exit(1)
 	}
 
@@ -334,5 +347,5 @@ func main() {
 	defer client.Close()
 	writeAPI := client.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
 
-	scrapeLoop(ctx, &cfg, writeAPI)
+	scrapeLoop(ctx, cfg, writeAPI, defaultClientFactory)
 }

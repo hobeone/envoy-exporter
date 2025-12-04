@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
+	"time"
 
 	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
 	envoy "github.com/loafoe/go-envoy"
@@ -151,6 +153,39 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+func TestLoadConfig(t *testing.T) {
+	// Create a temporary config file
+	content := []byte(`
+address: http://localhost:8080
+serial: 123456
+username: admin
+influxdb: http://localhost:8086
+influxdb_token: mytoken
+influxdb_org: myorg
+influxdb_bucket: mybucket
+interval: 10
+`)
+	tmpfile, err := os.CreateTemp("", "config.*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name()) // clean up
+
+	if _, err := tmpfile.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(tmpfile.Name())
+	assert.NoError(t, err)
+	assert.NotNil(t, cfg)
+	assert.Equal(t, "http://localhost:8080", cfg.Address)
+	assert.Equal(t, "123456", cfg.SerialNumber)
+	assert.Equal(t, 10, cfg.Interval)
+}
+
 func TestLineToPoint(t *testing.T) {
 	line := envoy.Line{
 		WNow:       100,
@@ -190,7 +225,7 @@ func TestExtractProductionStats(t *testing.T) {
 	prod := &envoy.ProductionResponse{
 		Production: []envoy.Measurement{
 			{
-				MeasurementType: "production",
+				MeasurementType: MeasurementProduction,
 				Lines: []envoy.Line{
 					{WNow: 100},
 				},
@@ -198,13 +233,13 @@ func TestExtractProductionStats(t *testing.T) {
 		},
 		Consumption: []envoy.Measurement{
 			{
-				MeasurementType: "total-consumption",
+				MeasurementType: MeasurementTotalConsumption,
 				Lines: []envoy.Line{
 					{WNow: 200},
 				},
 			},
 			{
-				MeasurementType: "net-consumption",
+				MeasurementType: MeasurementNetConsumption,
 				Lines: []envoy.Line{
 					{WNow: 300},
 				},
@@ -295,7 +330,7 @@ func TestScrape(t *testing.T) {
 					return &envoy.ProductionResponse{
 						Production: []envoy.Measurement{
 							{
-								MeasurementType: "production",
+								MeasurementType: MeasurementProduction,
 								Lines:           []envoy.Line{{WNow: 100}},
 							},
 						},
@@ -334,4 +369,50 @@ func TestScrape(t *testing.T) {
 			assert.Equal(t, tt.expectedPoints, numPoints)
 		})
 	}
+}
+
+func TestScrapeLoop(t *testing.T) {
+	// Setup context that expires quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Setup mocks
+	mockClient := &MockEnvoyClient{
+		ProductionFunc: func() (*envoy.ProductionResponse, error) {
+			return &envoy.ProductionResponse{
+				Production: []envoy.Measurement{
+					{
+						MeasurementType: MeasurementProduction,
+						Lines:           []envoy.Line{{WNow: 100}},
+					},
+				},
+			}, nil
+		},
+	}
+	
+	pointCount := 0
+	mockWriter := &MockPointWriter{
+		WritePointFunc: func(ctx context.Context, points ...*influxdb2write.Point) error {
+			pointCount += len(points)
+			return nil
+		},
+	}
+
+	// Mock factory
+	mockFactory := func(cfg *Config) (EnvoyClient, error) {
+		return mockClient, nil
+	}
+
+	cfg := &Config{
+		Interval: 1, // 1 second interval (longer than timeout, so likely only one scrape will happen)
+		Address: "http://mock",
+	}
+
+	// Run scrapeLoop
+	// Since we use a short timeout, it should run once (immediate) and then maybe exit or wait.
+	// The immediate scrape is done before the loop.
+	scrapeLoop(ctx, cfg, mockWriter, mockFactory)
+
+	// Assert that at least one scrape happened
+	assert.Greater(t, pointCount, 0, "Should have written at least one point")
 }

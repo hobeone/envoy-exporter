@@ -4,11 +4,7 @@ This document outlines opportunities for modernizing and simplifying the `envoy-
 
 ## Future Improvements
 
-### 1. Enhanced Test Coverage
-**Issue:** Tests currently cover the extraction logic and basic scraping flow.
-**Solution:**
-- Add tests for `scrapeLoop` (now that it is more testable with context).
-- Add tests for configuration loading.
+(None listed - all tasks complete)
 
 ## Completed Improvements
 
@@ -19,3 +15,4 @@ This document outlines opportunities for modernizing and simplifying the `envoy-
 - **Configuration Validation:** Added a `Validate()` method to the `Config` struct to centralize validation logic and improved tests.
 - **Hardcoded Values:** Replaced magic strings with constants and made the expvar port configurable.
 - **Structured Logging:** Migrated from `logrus` to the standard library `log/slog`, implementing structured logging with contextual fields.
+- **Enhanced Test Coverage:** Added tests for `LoadConfig` and `scrapeLoop`, introducing `ClientFactory` to mock client creation.
