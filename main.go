@@ -11,6 +11,7 @@ import (
 	_ "expvar"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,7 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/sirupsen/logrus"
 	yaml "gopkg.in/yaml.v3"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
@@ -169,7 +169,7 @@ type PointWriter interface {
 func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag string) int {
 	prod, err := e.Production()
 	if err != nil {
-		log.Errorf("Error getting Production data from Envoy: %v", err)
+		slog.Error("Error getting Production data from Envoy", "error", err, "operation", "e.Production")
 	}
 	var points []*influxdb2write.Point
 	if prod != nil && len(prod.Production) > 0 {
@@ -177,7 +177,7 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	}
 	inverters, err := e.Inverters()
 	if err != nil {
-		log.Errorf("Error getting Inverter data from Envoy: %v", err)
+		slog.Error("Error getting Inverter data from Envoy", "error", err, "operation", "e.Inverters")
 	}
 	if inverters != nil && len(*inverters) > 0 {
 		points = append(points, extractInverterStats(inverters, sourceTag)...)
@@ -185,7 +185,7 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 
 	batteries, err := e.Batteries()
 	if err != nil {
-		log.Errorf("Error getting Battery data from Envoy: %v", err)
+		slog.Error("Error getting Battery data from Envoy", "error", err, "operation", "e.Batteries")
 	} else if batteries != nil {
 		points = append(points, extractBatteryStats(batteries, sourceTag)...)
 	}
@@ -193,14 +193,17 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	if len(points) > 0 {
 		err = writeAPI.WritePoint(ctx, points...)
 		if err != nil {
-			log.Errorf("Error writing data to InfluxDB: %v", err)
+			slog.Error("Error writing data to InfluxDB",
+				"error", err,
+				"points_count", len(points),
+				"target", "influxdb")
 		}
 	}
 	return len(points)
 }
 
 func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter) {
-	log.Infof("Connecting to envoy at: %s", cfg.Address)
+	slog.Info("Connecting to envoy", "address", cfg.Address)
 	var e EnvoyClient
 	var err error
 	
@@ -221,8 +224,8 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter) {
 				envoy.WithDebug(true),
 				envoy.WithJWT(cfg.JWT))
 			if err != nil {
-				log.Error(err)
-				log.Info("Retrying connection in 5 seconds...")
+				slog.Error("Error connecting to Envoy", "error", err)
+				slog.Info("Retrying connection in 5 seconds...")
 				select {
 				case <-ctx.Done():
 					return
@@ -241,18 +244,28 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("Stopping scrape loop...")
+			slog.Info("Stopping scrape loop...")
 			return
 		case <-ticker.C:
 			tStat := time.Now()
 			numPoints := scrape(ctx, e, writeAPI, cfg.SourceTag)
 			scrapeDuration := time.Since(tStat)
-			log.Infof("Scrape took: %v, found %d points", scrapeDuration, numPoints)
+			slog.Info("Scrape finished",
+				"duration", scrapeDuration,
+				"points", numPoints)
 		}
 	}
 }
 
 func main() {
+	// Setup structured logger (JSON handler or Text handler)
+	// Using TextHandler for now to mimic previous output but structured
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+
 	// Setup context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -262,7 +275,7 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		log.Info("Received shutdown signal")
+		slog.Info("Received shutdown signal")
 		cancel()
 	}()
 
@@ -275,17 +288,19 @@ func main() {
 		Interval: 5,
 	}
 
-	log.Infof("Reading Config: %s", cfgFile)
+	slog.Info("Reading Config", "file", cfgFile)
 	f, err := os.Open(cfgFile)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Failed to open config file", "error", err)
+		os.Exit(1)
 	}
 	defer f.Close()
 
 	decoder := yaml.NewDecoder(f)
 	err = decoder.Decode(&cfg)
 	if err != nil {
-		log.Fatalf("Error reading config: %v", err)
+		slog.Error("Error reading config", "error", err)
+		os.Exit(1)
 	}
 
 	go func() {
@@ -294,20 +309,25 @@ func main() {
 		if port == 0 {
 			port = 6666
 		}
-		log.Infof("Starting expvar server on port %d", port)
-		log.Println(http.ListenAndServe(fmt.Sprintf("localhost:%d", port), nil))
+		slog.Info("Starting expvar server", "port", port)
+		slog.Error("expvar server failed", "error", http.ListenAndServe(fmt.Sprintf("localhost:%d", port), nil))
 	}()
-	log.SetFormatter(&log.TextFormatter{
-		FullTimestamp: true,
-	})
 
 	if err := cfg.Validate(); err != nil {
-		log.Fatal(err)
+		slog.Error("Configuration validation failed", "error", err)
+		os.Exit(1)
 	}
 
-	log.Infof("Built with Go version: %s\n", runtime.Version())
-	log.Debugf("Scraping envoy at: %s with serial number %s every %d seconds", cfg.Address, cfg.SerialNumber, cfg.Interval)
-	log.Debugf("Writing to Influxdb: %s, Bucket '%s'", cfg.InfluxDB, cfg.InfluxDBBucket)
+	slog.Info("Starting Envoy Exporter", "go_version", runtime.Version())
+	// Debug logs - slog defaults to Info, so these won't show unless level is changed above
+	// But we'll keep them as Debug
+	slog.Debug("Scraping envoy",
+		"address", cfg.Address,
+		"serial", cfg.SerialNumber,
+		"interval", cfg.Interval)
+	slog.Debug("Writing to Influxdb",
+		"url", cfg.InfluxDB,
+		"bucket", cfg.InfluxDBBucket)
 
 	// Initialize InfluxDB Client
 	client := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)

@@ -4,13 +4,7 @@ This document outlines opportunities for modernizing and simplifying the `envoy-
 
 ## Future Improvements
 
-### 1. Structured Logging Improvements
-**Issue:** `scrape` logs errors but continues.
-**Solution:**
-- Ensure all logs include relevant context (e.g., fields for which part of the scrape failed).
-- Review log levels (some `Fatal` in `main` could be handling errors more gracefully).
-
-### 2. Enhanced Test Coverage
+### 1. Enhanced Test Coverage
 **Issue:** Tests currently cover the extraction logic and basic scraping flow.
 **Solution:**
 - Add tests for `scrapeLoop` (now that it is more testable with context).
@@ -24,3 +18,4 @@ This document outlines opportunities for modernizing and simplifying the `envoy-
 - **Dependency Injection:** `scrape` and `scrapeLoop` now accept dependencies (client, writer) via interfaces.
 - **Configuration Validation:** Added a `Validate()` method to the `Config` struct to centralize validation logic and improved tests.
 - **Hardcoded Values:** Replaced magic strings with constants and made the expvar port configurable.
+- **Structured Logging:** Migrated from `logrus` to the standard library `log/slog`, implementing structured logging with contextual fields.

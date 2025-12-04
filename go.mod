@@ -7,7 +7,6 @@ toolchain go1.25.1
 require (
 	github.com/influxdata/influxdb-client-go/v2 v2.14.0
 	github.com/loafoe/go-envoy v0.2.0
-	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
 )
