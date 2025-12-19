@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	_ "expvar"
 	"flag"
 	"fmt"
@@ -305,10 +306,19 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFa
 }
 
 func main() {
-	// Setup structured logger (JSON handler or Text handler)
-	// Using TextHandler for now to mimic previous output but structured
+	var cfgFile string
+	var debug bool
+	flag.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
+	flag.BoolVar(&debug, "debug", false, "Enable debug logging.")
+	flag.Parse()
+
+	// Setup structured logger
+	logLevel := slog.LevelInfo
+	if debug {
+		logLevel = slog.LevelDebug
+	}
 	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	})
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
@@ -318,17 +328,13 @@ func main() {
 	defer cancel()
 
 	// Handle signals
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-c
+		<-sigCh
 		slog.Info("Received shutdown signal")
 		cancel()
 	}()
-
-	var cfgFile string
-	flag.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
-	flag.Parse()
 
 	slog.Info("Reading Config", "file", cfgFile)
 	cfg, err := LoadConfig(cfgFile)
@@ -337,14 +343,32 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Start expvar server with graceful shutdown
 	go func() {
-		// For expvar exporting to netdata
 		port := cfg.ExpVarPort
 		if port == 0 {
 			port = 6666
 		}
-		slog.Info("Starting expvar server", "port", port)
-		slog.Error("expvar server failed", "error", http.ListenAndServe(fmt.Sprintf("localhost:%d", port), nil))
+		addr := fmt.Sprintf("localhost:%d", port)
+		srv := &http.Server{
+			Addr:    addr,
+			Handler: nil, // Use DefaultServeMux for expvar
+		}
+
+		go func() {
+			slog.Info("Starting expvar server", "port", port)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("expvar server failed", "error", err)
+			}
+		}()
+
+		<-ctx.Done()
+		slog.Info("Shutting down expvar server...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("expvar server shutdown failed", "error", err)
+		}
 	}()
 
 	if err := cfg.Validate(); err != nil {
