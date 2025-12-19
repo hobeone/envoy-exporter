@@ -27,26 +27,43 @@ import (
 )
 
 const (
-	MeasurementProduction       = "production"
+	// MeasurementProduction is the measurement name for production data.
+	MeasurementProduction = "production"
+	// MeasurementTotalConsumption is the measurement name for total consumption data.
 	MeasurementTotalConsumption = "total-consumption"
-	MeasurementNetConsumption   = "net-consumption"
-	MeasurementInverter         = "inverter"
-	MeasurementBattery          = "battery"
+	// MeasurementNetConsumption is the measurement name for net consumption data.
+	MeasurementNetConsumption = "net-consumption"
+	// MeasurementInverter is the measurement name for inverter data.
+	MeasurementInverter = "inverter"
+	// MeasurementBattery is the measurement name for battery data.
+	MeasurementBattery = "battery"
 
-	TagSource          = "source"
+	// TagSource is the tag key for the data source.
+	TagSource = "source"
+	// TagMeasurementType is the tag key for the measurement type.
 	TagMeasurementType = "measurement-type"
-	TagLineIdx         = "line-idx"
-	TagSerial          = "serial"
+	// TagLineIdx is the tag key for the line index.
+	TagLineIdx = "line-idx"
+	// TagSerial is the tag key for the device serial number.
+	TagSerial = "serial"
 
-	FieldP           = "P"
-	FieldQ           = "Q"
-	FieldS           = "S"
-	FieldIrms        = "I_rms"
-	FieldVrms        = "V_rms"
+	// FieldP is the field key for real power (Watts).
+	FieldP = "P"
+	// FieldQ is the field key for reactive power (VAR).
+	FieldQ = "Q"
+	// FieldS is the field key for apparent power (VA).
+	FieldS = "S"
+	// FieldIrms is the field key for RMS current (Amps).
+	FieldIrms = "I_rms"
+	// FieldVrms is the field key for RMS voltage (Volts).
+	FieldVrms = "V_rms"
+	// FieldPercentFull is the field key for battery state of charge (percentage).
 	FieldPercentFull = "percent-full"
+	// FieldTemperature is the field key for battery temperature.
 	FieldTemperature = "temperature"
 )
 
+// ClientFactory is a function type that returns an EnvoyClient.
 type ClientFactory func(cfg *Config) (EnvoyClient, error)
 
 func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
@@ -58,6 +75,7 @@ func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
 		envoy.WithJWT(cfg.JWT))
 }
 
+// Config holds the exporter configuration.
 type Config struct {
 	Username       string `yaml:"username"`
 	Password       string `yaml:"password"`
@@ -73,6 +91,7 @@ type Config struct {
 	ExpVarPort     int    `yaml:"expvar_port"`
 }
 
+// Validate checks if the configuration is valid.
 func (c *Config) Validate() error {
 	if c.Address == "" {
 		return fmt.Errorf("missing required configuration: address")
@@ -98,6 +117,7 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// LoadConfig reads the configuration from the specified file.
 func LoadConfig(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -185,6 +205,7 @@ func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string) []*influx
 	return bats
 }
 
+// EnvoyClient is an interface that defines the methods for interacting with the Envoy.
 type EnvoyClient interface {
 	Production() (*envoy.ProductionResponse, error)
 	Inverters() (*[]envoy.Inverter, error)
@@ -192,7 +213,7 @@ type EnvoyClient interface {
 	InvalidateSession()
 }
 
-// PointWriter abstracts the InfluxDB WriteAPIBlocking
+// PointWriter abstracts the InfluxDB WriteAPIBlocking.
 type PointWriter interface {
 	WritePoint(ctx context.Context, point ...*influxdb2write.Point) error
 }
