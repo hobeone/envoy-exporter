@@ -317,10 +317,10 @@ func TestExtractBatteryStats(t *testing.T) {
 
 func TestScrape(t *testing.T) {
 	mockWriter := &MockPointWriter{}
-	
+
 	tests := []struct {
-		name          string
-		mockClient    *MockEnvoyClient
+		name           string
+		mockClient     *MockEnvoyClient
 		expectedPoints int
 	}{
 		{
@@ -389,7 +389,7 @@ func TestScrapeLoop(t *testing.T) {
 			}, nil
 		},
 	}
-	
+
 	pointCount := 0
 	mockWriter := &MockPointWriter{
 		WritePointFunc: func(ctx context.Context, points ...*influxdb2write.Point) error {
@@ -405,7 +405,7 @@ func TestScrapeLoop(t *testing.T) {
 
 	cfg := &Config{
 		Interval: 1, // 1 second interval (longer than timeout, so likely only one scrape will happen)
-		Address: "http://mock",
+		Address:  "http://mock",
 	}
 
 	// Run scrapeLoop

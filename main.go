@@ -237,7 +237,7 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFa
 	slog.Info("Connecting to envoy", "address", cfg.Address)
 	var e EnvoyClient
 	var err error
-	
+
 	// Initial connection loop
 	ticker := time.NewTicker(time.Duration(cfg.Interval) * time.Second)
 	defer ticker.Stop()
