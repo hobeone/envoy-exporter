@@ -316,8 +316,6 @@ func TestExtractBatteryStats(t *testing.T) {
 }
 
 func TestScrape(t *testing.T) {
-	mockWriter := &MockPointWriter{}
-
 	tests := []struct {
 		name           string
 		mockClient     *MockEnvoyClient
@@ -361,11 +359,33 @@ func TestScrape(t *testing.T) {
 			},
 			expectedPoints: 0,
 		},
+		{
+			name: "write error",
+			mockClient: &MockEnvoyClient{
+				ProductionFunc: func() (*envoy.ProductionResponse, error) {
+					return &envoy.ProductionResponse{
+						Production: []envoy.Measurement{
+							{
+								MeasurementType: MeasurementProduction,
+								Lines:           []envoy.Line{{WNow: 100}},
+							},
+						},
+					}, nil
+				},
+			},
+			expectedPoints: 1,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			numPoints := scrape(context.Background(), tt.mockClient, mockWriter, "test")
+			writer := &MockPointWriter{}
+			if tt.name == "write error" {
+				writer.WritePointFunc = func(ctx context.Context, points ...*influxdb2write.Point) error {
+					return errors.New("write error")
+				}
+			}
+			numPoints := scrape(context.Background(), tt.mockClient, writer, "test")
 			assert.Equal(t, tt.expectedPoints, numPoints)
 		})
 	}
@@ -415,4 +435,66 @@ func TestScrapeLoop(t *testing.T) {
 
 	// Assert that at least one scrape happened
 	assert.Greater(t, pointCount, 0, "Should have written at least one point")
+}
+
+func TestScrapeLoop_Retry(t *testing.T) {
+	// Setup context that expires
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	mockClient := &MockEnvoyClient{}
+	mockWriter := &MockPointWriter{}
+
+	retryCount := 0
+	mockFactory := func(cfg *Config) (EnvoyClient, error) {
+		retryCount++
+		if retryCount < 2 {
+			return nil, errors.New("connection failed")
+		}
+		return mockClient, nil
+	}
+
+	cfg := &Config{
+		Interval:      1,
+		RetryInterval: 1, // 1 second
+		Address:       "http://mock",
+	}
+
+	scrapeLoop(ctx, cfg, mockWriter, mockFactory)
+
+	assert.GreaterOrEqual(t, retryCount, 2, "Should have retried at least once")
+}
+
+func TestRun_Error(t *testing.T) {
+	// Test parsing error
+	err := run([]string{"-invalid"})
+	assert.Error(t, err)
+
+	// Test missing config error
+	err = run([]string{"-config", "nonexistent.yaml"})
+	assert.Error(t, err)
+}
+
+func TestRun_ValidationFail(t *testing.T) {
+	// Create a temporary config file that is valid YAML but fails validation
+	content := []byte(`
+address: http://localhost:8080
+serial: 123456
+`)
+	tmpfile, err := os.CreateTemp("", "config.*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = run([]string{"-config", tmpfile.Name()})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "configuration validation failed")
 }

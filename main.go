@@ -90,6 +90,7 @@ type Config struct {
 	InfluxDBBucket string `yaml:"influxdb_bucket"`
 	Interval       int    `yaml:"interval" validate:"required"`
 	ExpVarPort     int    `yaml:"expvar_port"`
+	RetryInterval  int    `yaml:"retry_interval"`
 }
 
 // Validate checks if the configuration is valid.
@@ -264,6 +265,11 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFa
 	ticker := time.NewTicker(time.Duration(cfg.Interval) * time.Second)
 	defer ticker.Stop()
 
+	retryInterval := time.Duration(cfg.RetryInterval) * time.Second
+	if retryInterval == 0 {
+		retryInterval = 5 * time.Second
+	}
+
 	// Retry logic for initial connection
 	for {
 		select {
@@ -273,11 +279,11 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFa
 			e, err = clientFactory(cfg)
 			if err != nil {
 				slog.Error("Error connecting to Envoy", "error", err)
-				slog.Info("Retrying connection in 5 seconds...")
+				slog.Info("Retrying connection...", "wait", retryInterval)
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-time.After(retryInterval):
 					continue
 				}
 			}
@@ -306,11 +312,21 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFa
 }
 
 func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	fs := flag.NewFlagSet("envoy-exporter", flag.ContinueOnError)
 	var cfgFile string
 	var debug bool
-	flag.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
-	flag.BoolVar(&debug, "debug", false, "Enable debug logging.")
-	flag.Parse()
+	fs.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
+	fs.BoolVar(&debug, "debug", false, "Enable debug logging.")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	// Setup structured logger
 	logLevel := slog.LevelInfo
@@ -339,8 +355,7 @@ func main() {
 	slog.Info("Reading Config", "file", cfgFile)
 	cfg, err := LoadConfig(cfgFile)
 	if err != nil {
-		slog.Error("Failed to load config", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to load config: %w", err)
 	}
 
 	// Start expvar server with graceful shutdown
@@ -372,20 +387,14 @@ func main() {
 	}()
 
 	if err := cfg.Validate(); err != nil {
-		slog.Error("Configuration validation failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("configuration validation failed: %w", err)
 	}
 
 	slog.Info("Starting Envoy Exporter", "go_version", runtime.Version())
-	// Debug logs - slog defaults to Info, so these won't show unless level is changed above
-	// But we'll keep them as Debug
 	slog.Debug("Scraping envoy",
 		"address", cfg.Address,
 		"serial", cfg.SerialNumber,
 		"interval", cfg.Interval)
-	slog.Debug("Writing to Influxdb",
-		"url", cfg.InfluxDB,
-		"bucket", cfg.InfluxDBBucket)
 
 	// Initialize InfluxDB Client
 	client := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
@@ -393,4 +402,5 @@ func main() {
 	writeAPI := client.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
 
 	scrapeLoop(ctx, cfg, writeAPI, defaultClientFactory)
+	return nil
 }
