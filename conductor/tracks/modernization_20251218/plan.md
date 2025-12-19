@@ -4,7 +4,7 @@
 Goal: Establish the current state of the project and ensure the development environment is ready.
 
 - [x] Task: Verify Go environment and dependencies (run `go mod tidy`) [39518dd]
-- [ ] Task: Establish baseline test coverage using `go test -coverprofile=coverage.out ./...`
+- [x] Task: Establish baseline test coverage using `go test -coverprofile=coverage.out ./...` [f5b733c]
 - [ ] Task: Conductor - User Manual Verification 'Baseline and Setup' (Protocol in workflow.md)
 
 ## Phase 2: Formalization and Cleanup
