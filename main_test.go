@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -497,4 +499,51 @@ serial: 123456
 	err = run([]string{"-config", tmpfile.Name()})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "configuration validation failed")
+}
+
+func TestAuthenticateWithEnphase(t *testing.T) {
+	// Start a local HTTP server
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/login/login" {
+			if req.Method != "POST" {
+				http.Error(rw, "Method Not Allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if err := req.ParseForm(); err != nil {
+				http.Error(rw, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			if req.FormValue("user[email]") == "user" && req.FormValue("user[password]") == "pass" {
+				rw.WriteHeader(http.StatusOK)
+				return
+			}
+			http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if req.URL.Path == "/entrez-auth-token" {
+			query := req.URL.Query()
+			if query.Get("serial_num") == "12345" {
+				rw.WriteHeader(http.StatusOK)
+				rw.Write([]byte("mock-jwt-token"))
+				return
+			}
+			http.Error(rw, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		http.Error(rw, "Not Found", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	// Redirect AuthenticateWithEnphase to use the mock server
+	originalURL := EnphaseBaseURL
+	EnphaseBaseURL = server.URL
+	defer func() { EnphaseBaseURL = originalURL }()
+
+	token, err := AuthenticateWithEnphase("user", "pass", "12345")
+	assert.NoError(t, err)
+	assert.Equal(t, "mock-jwt-token", token)
+
+	// Test failure
+	_, err = AuthenticateWithEnphase("wrong", "pass", "12345")
+	assert.Error(t, err)
 }

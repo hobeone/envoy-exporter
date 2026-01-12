@@ -12,8 +12,11 @@ import (
 	_ "expvar"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -63,6 +66,8 @@ const (
 	// FieldTemperature is the field key for battery temperature.
 	FieldTemperature = "temperature"
 )
+
+var EnphaseBaseURL = "https://enlighten.enphaseenergy.com"
 
 // ClientFactory is a function type that returns an EnvoyClient.
 type ClientFactory func(cfg *Config) (EnvoyClient, error)
@@ -188,7 +193,6 @@ func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string) []*infl
 			SetTime(time.Now())
 		ps[i] = pt
 	}
-
 	return ps
 }
 
@@ -254,6 +258,47 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 		}
 	}
 	return len(points)
+}
+
+// AuthenticateWithEnphase gets a new JWT token from Enphase
+func AuthenticateWithEnphase(username, password, serial string) (string, error) {
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+	}
+
+	// Login
+	resp, err := client.PostForm(EnphaseBaseURL+"/login/login", url.Values{
+		"user[email]":    {username},
+		"user[password]": {password},
+	})
+	if err != nil {
+		return "", fmt.Errorf("login failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("login failed with status: %s", resp.Status)
+	}
+
+	// Get Token
+	tokenURL := fmt.Sprintf("%s/entrez-auth-token?serial_num=%s", EnphaseBaseURL, serial)
+	resp, err = client.Get(tokenURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to get token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get token failed with status: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read token response: %w", err)
+	}
+
+	return string(body), nil
 }
 
 func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFactory ClientFactory) {
@@ -358,6 +403,17 @@ func run(args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
+	if cfg.JWT == "" && cfg.Username != "" && cfg.Password != "" {
+		slog.Info("JWT token missing, attempting to fetch from Enphase...")
+		token, err := AuthenticateWithEnphase(cfg.Username, cfg.Password, cfg.SerialNumber)
+		if err != nil {
+			slog.Error("Failed to fetch JWT token", "error", err)
+		} else {
+			slog.Info("Successfully fetched JWT token")
+			cfg.JWT = token
+		}
+	}
+
 	// Start expvar server with graceful shutdown
 	go func() {
 		port := cfg.ExpVarPort
@@ -395,6 +451,9 @@ func run(args []string) error {
 		"address", cfg.Address,
 		"serial", cfg.SerialNumber,
 		"interval", cfg.Interval)
+	slog.Debug("Writing to Influxdb",
+		"url", cfg.InfluxDB,
+		"bucket", cfg.InfluxDBBucket)
 
 	// Initialize InfluxDB Client
 	client := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
