@@ -1,3 +1,4 @@
 envoy-exporter
 coverage.out
 conductor/setup_state.json
+envoy.yaml

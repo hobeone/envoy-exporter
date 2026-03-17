@@ -1,0 +1,13 @@
+services:
+  envoy-exporter:
+    build: .
+    image: envoy-exporter:latest
+    container_name: envoy-exporter
+    restart: unless-stopped
+    volumes:
+      - ./envoy.yaml:/etc/envoy-exporter/envoy.yaml:ro
+    ports:
+      - "6666:6666"
+    # Example environment variables if needed
+    # environment:
+    #   - TZ=UTC
