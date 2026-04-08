@@ -1,8 +1,0 @@
-{
-  "track_id": "modernization_20251218",
-  "type": "chore",
-  "status": "new",
-  "created_at": "2025-12-18T00:00:00Z",
-  "updated_at": "2025-12-18T00:00:00Z",
-  "description": "Project Modernization: Finalize and formalize the current codebase into the Conductor structure and address any remaining items from improvements.md."
-}
