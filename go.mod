@@ -5,6 +5,7 @@ go 1.25.0
 toolchain go1.25.1
 
 require (
+	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/influxdata/influxdb-client-go/v2 v2.14.0
 	github.com/loafoe/go-envoy v0.3.0
 	github.com/stretchr/testify v1.11.1
@@ -14,17 +15,16 @@ require (
 require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/mdns v1.0.6 // indirect
 	github.com/influxdata/line-protocol v0.0.0-20210922203350-b1ad95c89adf // indirect
 	github.com/kr/pretty v0.3.1 // indirect
-	github.com/miekg/dns v1.1.69 // indirect
-	github.com/oapi-codegen/runtime v1.1.2 // indirect
+	github.com/miekg/dns v1.1.72 // indirect
+	github.com/oapi-codegen/runtime v1.4.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	golang.org/x/mod v0.31.0 // indirect
-	golang.org/x/net v0.48.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
-	golang.org/x/tools v0.40.0 // indirect
+	golang.org/x/mod v0.34.0 // indirect
+	golang.org/x/net v0.52.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/tools v0.43.0 // indirect
 )

@@ -1,15 +1,10 @@
-/*
-Copyright © 2024 Daniel Hobe hobe@gmail.com
-
-JWT token can be gotten from:
-https://enlighten.enphaseenergy.com/entrez-auth-token?serial_num=YOURSERIAL_NUM_HERE
-*/
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	_ "expvar"
+	"expvar"
 	"flag"
 	"fmt"
 	"io"
@@ -19,255 +14,46 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	yaml "gopkg.in/yaml.v3"
-
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
-	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
 	envoy "github.com/loafoe/go-envoy"
+	yaml "gopkg.in/yaml.v3"
 )
 
-const (
-	// MeasurementProduction is the measurement name for production data.
-	MeasurementProduction = "production"
-	// MeasurementTotalConsumption is the measurement name for total consumption data.
-	MeasurementTotalConsumption = "total-consumption"
-	// MeasurementNetConsumption is the measurement name for net consumption data.
-	MeasurementNetConsumption = "net-consumption"
-	// MeasurementInverter is the measurement name for inverter data.
-	MeasurementInverter = "inverter"
-	// MeasurementBattery is the measurement name for battery data.
-	MeasurementBattery = "battery"
-
-	// TagSource is the tag key for the data source.
-	TagSource = "source"
-	// TagMeasurementType is the tag key for the measurement type.
-	TagMeasurementType = "measurement-type"
-	// TagLineIdx is the tag key for the line index.
-	TagLineIdx = "line-idx"
-	// TagSerial is the tag key for the device serial number.
-	TagSerial = "serial"
-
-	// FieldP is the field key for real power (Watts).
-	FieldP = "P"
-	// FieldQ is the field key for reactive power (VAR).
-	FieldQ = "Q"
-	// FieldS is the field key for apparent power (VA).
-	FieldS = "S"
-	// FieldIrms is the field key for RMS current (Amps).
-	FieldIrms = "I_rms"
-	// FieldVrms is the field key for RMS voltage (Volts).
-	FieldVrms = "V_rms"
-	// FieldPercentFull is the field key for battery state of charge (percentage).
-	FieldPercentFull = "percent-full"
-	// FieldTemperature is the field key for battery temperature.
-	FieldTemperature = "temperature"
-)
-
+// EnphaseBaseURL is the base URL for the Enphase Enlighten API.
+// Overridable in tests.
 var EnphaseBaseURL = "https://enlighten.enphaseenergy.com"
 
-// ClientFactory is a function type that returns an EnvoyClient.
-type ClientFactory func(cfg *Config) (EnvoyClient, error)
+// expvar metrics published at /debug/vars.
+var (
+	metricScrapeTotal          = expvar.NewInt("scrape_total")
+	metricScrapeErrors         = expvar.NewInt("scrape_errors")
+	metricPointsWrittenTotal   = expvar.NewInt("points_written_total")
+	metricLastScrapeDurationMs = expvar.NewInt("last_scrape_duration_ms")
+	metricLastScrapeTime       = expvar.NewInt("last_scrape_time")
+)
 
 func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
-	return envoy.NewClient(cfg.Username,
-		cfg.Password,
-		cfg.SerialNumber,
+	return envoy.NewClient(
+		cfg.Username, cfg.Password, cfg.SerialNumber,
 		envoy.WithGatewayAddress(cfg.Address),
-		envoy.WithDebug(true),
-		envoy.WithJWT(cfg.JWT))
+		envoy.WithJWT(cfg.JWT),
+	)
 }
 
-// Config holds the exporter configuration.
-type Config struct {
-	Username       string `yaml:"username"`
-	Password       string `yaml:"password"`
-	JWT            string `yaml:"jwt"`
-	Address        string `yaml:"address"`
-	SerialNumber   string `yaml:"serial"`
-	SourceTag      string `yaml:"source"`
-	InfluxDB       string `yaml:"influxdb"`
-	InfluxDBToken  string `yaml:"influxdb_token"`
-	InfluxDBOrg    string `yaml:"influxdb_org"`
-	InfluxDBBucket string `yaml:"influxdb_bucket"`
-	Interval       int    `yaml:"interval" validate:"required"`
-	ExpVarPort     int    `yaml:"expvar_port"`
-	RetryInterval  int    `yaml:"retry_interval"`
-}
-
-// Validate checks if the configuration is valid.
-func (c *Config) Validate() error {
-	if c.Address == "" {
-		return fmt.Errorf("missing required configuration: address")
-	}
-	if c.SerialNumber == "" {
-		return fmt.Errorf("missing required configuration: serial")
-	}
-	if (c.Username == "" && c.Password == "") && c.JWT == "" {
-		return fmt.Errorf("missing Envoy authentication. Add username & password and optionally the JWT token")
-	}
-	if c.InfluxDB == "" {
-		return fmt.Errorf("missing required configuration: influxdb")
-	}
-	if c.InfluxDBBucket == "" {
-		return fmt.Errorf("missing required configuration: influxdb_bucket")
-	}
-	if c.InfluxDBToken == "" {
-		return fmt.Errorf("missing required configuration: influxdb_token")
-	}
-	if c.InfluxDBOrg == "" {
-		return fmt.Errorf("missing required configuration: influxdb_org")
-	}
-	return nil
-}
-
-// LoadConfig reads the configuration from the specified file.
-func LoadConfig(path string) (*Config, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open config file: %w", err)
-	}
-	defer f.Close()
-
-	// Default interval
-	cfg := Config{
-		Interval: 5,
-	}
-
-	decoder := yaml.NewDecoder(f)
-	err = decoder.Decode(&cfg)
-	if err != nil {
-		return nil, fmt.Errorf("error reading config: %w", err)
-	}
-	return &cfg, nil
-}
-
-func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string) *influxdb2write.Point {
-	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", lineType, idx)).
-		AddTag(TagSource, sourceTag).
-		AddTag(TagMeasurementType, lineType).
-		AddTag(TagLineIdx, fmt.Sprintf("%d", idx)).
-		AddField(FieldP, line.WNow).
-		AddField(FieldQ, line.ReactPwr).
-		AddField(FieldS, line.ApprntPwr).
-		AddField(FieldIrms, line.RmsCurrent).
-		AddField(FieldVrms, line.RmsVoltage).
-		SetTime(time.Now())
-}
-
-func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string) []*influxdb2write.Point {
-	var ps []*influxdb2write.Point
-	for _, measure := range prod.Production {
-		if measure.MeasurementType == MeasurementProduction {
-			for i, line := range measure.Lines {
-				ps = append(ps, lineToPoint(MeasurementProduction, line, i, sourceTag))
-			}
-		}
-	}
-	for _, measure := range prod.Consumption {
-		if measure.MeasurementType == MeasurementTotalConsumption {
-			for i, line := range measure.Lines {
-				ps = append(ps, lineToPoint("consumption", line, i, sourceTag))
-			}
-		}
-		if measure.MeasurementType == MeasurementNetConsumption {
-			for i, line := range measure.Lines {
-				ps = append(ps, lineToPoint("net", line, i, sourceTag))
-			}
-		}
-	}
-	return ps
-}
-
-func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string) []*influxdb2write.Point {
-	ps := make([]*influxdb2write.Point, len(*inverters))
-	for i, inv := range *inverters {
-		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("inverter-production-%s", inv.SerialNumber)).
-			AddTag(TagSource, sourceTag).
-			AddTag(TagMeasurementType, MeasurementInverter).
-			AddTag(TagSerial, inv.SerialNumber).
-			AddField(FieldP, inv.LastReportWatts).
-			SetTime(time.Now())
-		ps[i] = pt
-	}
-	return ps
-}
-
-func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string) []*influxdb2write.Point {
-	bats := make([]*influxdb2write.Point, len(*batteries))
-	for i, inv := range *batteries {
-		pt := influxdb2.NewPointWithMeasurement(fmt.Sprintf("battery-%s", inv.SerialNum)).
-			AddTag(TagSource, sourceTag).
-			AddTag(TagMeasurementType, MeasurementBattery).
-			AddTag(TagSerial, inv.SerialNum).
-			AddField(FieldPercentFull, inv.PercentFull).
-			AddField(FieldTemperature, inv.Temperature).
-			SetTime(time.Now())
-		bats[i] = pt
-	}
-	return bats
-}
-
-// EnvoyClient is an interface that defines the methods for interacting with the Envoy.
-type EnvoyClient interface {
-	Production() (*envoy.ProductionResponse, error)
-	Inverters() (*[]envoy.Inverter, error)
-	Batteries() (*[]envoy.Battery, error)
-	InvalidateSession()
-}
-
-// PointWriter abstracts the InfluxDB WriteAPIBlocking.
-type PointWriter interface {
-	WritePoint(ctx context.Context, point ...*influxdb2write.Point) error
-}
-
-func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag string) int {
-	prod, err := e.Production()
-	if err != nil {
-		slog.Error("Error getting Production data from Envoy", "error", err, "operation", "e.Production")
-	}
-	var points []*influxdb2write.Point
-	if prod != nil && len(prod.Production) > 0 {
-		points = append(points, extractProductionStats(prod, sourceTag)...)
-	}
-	inverters, err := e.Inverters()
-	if err != nil {
-		slog.Error("Error getting Inverter data from Envoy", "error", err, "operation", "e.Inverters")
-	}
-	if inverters != nil && len(*inverters) > 0 {
-		points = append(points, extractInverterStats(inverters, sourceTag)...)
-	}
-
-	batteries, err := e.Batteries()
-	if err != nil {
-		slog.Error("Error getting Battery data from Envoy", "error", err, "operation", "e.Batteries")
-	} else if batteries != nil {
-		points = append(points, extractBatteryStats(batteries, sourceTag)...)
-	}
-
-	if len(points) > 0 {
-		err = writeAPI.WritePoint(ctx, points...)
-		if err != nil {
-			slog.Error("Error writing data to InfluxDB",
-				"error", err,
-				"points_count", len(points),
-				"target", "influxdb")
-		}
-	}
-	return len(points)
-}
-
-// AuthenticateWithEnphase gets a new JWT token from Enphase
+// AuthenticateWithEnphase fetches a JWT from Enphase Enlighten using
+// username/password credentials. The response may be JSON {"token": "..."}
+// or a raw JWT string depending on the API version.
 func AuthenticateWithEnphase(username, password, serial string) (string, error) {
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{
-		Jar: jar,
-	}
+	client := &http.Client{Jar: jar}
 
-	// Login
 	resp, err := client.PostForm(EnphaseBaseURL+"/login/login", url.Values{
 		"user[email]":    {username},
 		"user[password]": {password},
@@ -276,83 +62,221 @@ func AuthenticateWithEnphase(username, password, serial string) (string, error) 
 		return "", fmt.Errorf("login failed: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("login failed with status: %s", resp.Status)
 	}
 
-	// Get Token
 	tokenURL := fmt.Sprintf("%s/entrez-auth-token?serial_num=%s", EnphaseBaseURL, serial)
-	resp, err = client.Get(tokenURL)
+	resp2, err := client.Get(tokenURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to get token: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("get token failed with status: %s", resp.Status)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get token failed with status: %s", resp2.Status)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp2.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read token response: %w", err)
 	}
 
-	return string(body), nil
+	// Production API returns JSON; test servers may return raw string.
+	raw := strings.TrimSpace(string(body))
+	if strings.HasPrefix(raw, "{") {
+		var tr struct {
+			Token string `json:"token"`
+		}
+		if jsonErr := json.Unmarshal(body, &tr); jsonErr == nil && tr.Token != "" {
+			return tr.Token, nil
+		}
+	}
+	return raw, nil
 }
 
-func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, clientFactory ClientFactory) {
-	slog.Info("Connecting to envoy", "address", cfg.Address)
-	var e EnvoyClient
-	var err error
+// parseJWTExpiry extracts the expiry time from a raw JWT without signature verification.
+func parseJWTExpiry(rawToken string) (time.Time, error) {
+	t, err := envoy.GetJWTExpired(rawToken)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return *t, nil
+}
 
-	// Initial connection loop
-	ticker := time.NewTicker(time.Duration(cfg.Interval) * time.Second)
-	defer ticker.Stop()
-
-	retryInterval := time.Duration(cfg.RetryInterval) * time.Second
-	if retryInterval == 0 {
-		retryInterval = 5 * time.Second
+// persistJWTToConfig updates the jwt field in the YAML config file at path
+// without disturbing other fields, comments, or formatting.
+// The write is atomic: it goes to a temp file in the same directory, then
+// os.Rename replaces the original, so a crash mid-write cannot corrupt it.
+func persistJWTToConfig(path, token string) error {
+	slog.Debug("Persisting JWT to config file", "file", path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat config file: %w", err)
 	}
 
-	// Retry logic for initial connection
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config file: %w", err)
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("parse config file: %w", err)
+	}
+	if len(doc.Content) == 0 {
+		return fmt.Errorf("config file is empty")
+	}
+	mapping := doc.Content[0] // top-level mapping node
+
+	// Find an existing jwt key and update its value in-place.
+	found := false
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == "jwt" {
+			mapping.Content[i+1].Value = token
+			found = true
+			break
+		}
+	}
+	// If the jwt key was absent, append it.
+	if !found {
+		mapping.Content = append(mapping.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: "jwt", Tag: "!!str"},
+			&yaml.Node{Kind: yaml.ScalarNode, Value: token, Tag: "!!str"},
+		)
+	}
+
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	// Atomic write: temp file in the same directory → rename.
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".envoy-jwt-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+
+	if err := tmp.Chmod(info.Mode()); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	slog.Info("JWT persisted to config file", "file", path)
+	return nil
+}
+
+// tokenFetcher is a function that obtains a fresh JWT from Enphase.
+type tokenFetcher func(username, password, serial string) (string, error)
+
+// jwtRefresher runs in a background goroutine, proactively refreshing the JWT
+// before expiry. On success it updates cfg.JWT, calls persist (if non-nil) to
+// write the new token to the config file, and signals reconnectCh so that
+// scrapeLoop can reconnect with the new token.
+func jwtRefresher(ctx context.Context, cfg *Config, expiry time.Time, reconnectCh chan<- struct{}, fetch tokenFetcher, persist func(string) error) {
+	leadTime := time.Duration(cfg.JWTRefreshLeadTime) * time.Minute
+	if leadTime == 0 {
+		leadTime = 60 * time.Minute
+	}
+
 	for {
+		delay := time.Until(expiry.Add(-leadTime))
+		if delay < 0 {
+			delay = 0
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			e, err = clientFactory(cfg)
+		case <-time.After(delay):
+		}
+
+		// Retry on failure until the context is cancelled.
+		for {
+			newToken, err := fetch(cfg.Username, cfg.Password, cfg.SerialNumber)
 			if err != nil {
-				slog.Error("Error connecting to Envoy", "error", err)
-				slog.Info("Retrying connection...", "wait", retryInterval)
+				slog.Error("JWT refresh failed; retrying", "error", err)
+				retryWait := time.Duration(cfg.RetryInterval) * time.Second
+				if retryWait == 0 {
+					retryWait = 5 * time.Second
+				}
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(retryInterval):
+				case <-time.After(retryWait):
 					continue
 				}
 			}
+
+			cfg.JWT = newToken
+			slog.Info("JWT refreshed successfully")
+
+			if persist != nil {
+				if err := persist(newToken); err != nil {
+					slog.Error("Failed to persist JWT to config file", "error", err)
+				}
+			}
+
+			// Non-blocking send: if a reconnect is already pending, don't queue another.
+			select {
+			case reconnectCh <- struct{}{}:
+			default:
+			}
+
+			newExpiry, err := parseJWTExpiry(newToken)
+			if err != nil {
+				slog.Warn("Could not parse refreshed JWT expiry; refresh disabled", "error", err)
+				return
+			}
+			expiry = newExpiry
+			break
 		}
-		break // Connected
 	}
+}
 
-	// Main scrape loop
-	// Perform an immediate scrape first
-	scrape(ctx, e, writeAPI, cfg.SourceTag)
+// parseLogLevel converts a level name string to the corresponding slog.Level.
+// An empty string maps to slog.LevelInfo (the default).
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("unknown log level %q; use debug, info, warn, or error", s)
+	}
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("Stopping scrape loop...")
+// healthHandler returns 200/ok when scrapes are current, 503 when stale or absent.
+func healthHandler(lastScrapeTime *atomic.Int64, interval int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		last := lastScrapeTime.Load()
+		if last == 0 {
+			http.Error(w, "no successful scrape yet", http.StatusServiceUnavailable)
 			return
-		case <-ticker.C:
-			tStat := time.Now()
-			numPoints := scrape(ctx, e, writeAPI, cfg.SourceTag)
-			scrapeDuration := time.Since(tStat)
-			slog.Info("Scrape finished",
-				"duration", scrapeDuration,
-				"points", numPoints)
 		}
+		deadline := time.Duration(interval) * time.Second * 3
+		if time.Since(time.Unix(last, 0)) > deadline {
+			http.Error(w, "last scrape too old", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
 	}
 }
 
@@ -367,28 +291,25 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("envoy-exporter", flag.ContinueOnError)
 	var cfgFile string
 	var debug bool
+	var logLevelFlag string
+	var persistJWTFlag bool
 	fs.StringVar(&cfgFile, "config", "envoy.yaml", "Path to config file.")
-	fs.BoolVar(&debug, "debug", false, "Enable debug logging.")
+	fs.BoolVar(&debug, "debug", false, "Shorthand for -log-level debug.")
+	fs.StringVar(&logLevelFlag, "log-level", "", "Log level: debug, info, warn, error (default: from config or \"info\").")
+	fs.BoolVar(&persistJWTFlag, "persist-jwt", false, "Persist refreshed JWT back to the config file (overrides persist_jwt in config).")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	// Setup structured logger
-	logLevel := slog.LevelInfo
-	if debug {
-		logLevel = slog.LevelDebug
+	if debug && logLevelFlag == "" {
+		logLevelFlag = "debug"
 	}
-	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	})
-	logger := slog.New(handler)
-	slog.SetDefault(logger)
 
-	// Setup context with cancellation
+	// Bootstrap at info so startup messages are always visible.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -397,69 +318,111 @@ func run(args []string) error {
 		cancel()
 	}()
 
-	slog.Info("Reading Config", "file", cfgFile)
+	slog.Info("Reading config", "file", cfgFile)
 	cfg, err := LoadConfig(cfgFile)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
-
-	if cfg.JWT == "" && cfg.Username != "" && cfg.Password != "" {
-		slog.Info("JWT token missing, attempting to fetch from Enphase...")
-		token, err := AuthenticateWithEnphase(cfg.Username, cfg.Password, cfg.SerialNumber)
-		if err != nil {
-			slog.Error("Failed to fetch JWT token", "error", err)
-		} else {
-			slog.Info("Successfully fetched JWT token")
-			cfg.JWT = token
-		}
-	}
-
-	// Start expvar server with graceful shutdown
-	go func() {
-		port := cfg.ExpVarPort
-		if port == 0 {
-			port = 6666
-		}
-		addr := fmt.Sprintf("localhost:%d", port)
-		srv := &http.Server{
-			Addr:    addr,
-			Handler: nil, // Use DefaultServeMux for expvar
-		}
-
-		go func() {
-			slog.Info("Starting expvar server", "port", port)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("expvar server failed", "error", err)
-			}
-		}()
-
-		<-ctx.Done()
-		slog.Info("Shutting down expvar server...")
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Error("expvar server shutdown failed", "error", err)
-		}
-	}()
-
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("configuration validation failed: %w", err)
 	}
 
-	slog.Info("Starting Envoy Exporter", "go_version", runtime.Version())
-	slog.Debug("Scraping envoy",
+	// Resolve final log level: CLI flag > config file > "info" default.
+	// Re-initialise the logger now that the config is available.
+	if logLevelFlag == "" {
+		logLevelFlag = cfg.LogLevel
+	}
+	level, err := parseLogLevel(logLevelFlag)
+	if err != nil {
+		return err
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+	slog.Debug("Logger configured", "level", logLevelFlag)
+
+	// Build the persist function once; used at both the initial fetch and on refresh.
+	var persistFn func(string) error
+	if persistJWTFlag || cfg.PersistJWT {
+		persistFn = func(token string) error {
+			return persistJWTToConfig(cfgFile, token)
+		}
+	}
+
+	// Auto-fetch JWT if credentials are present but no token was supplied.
+	if cfg.JWT == "" && cfg.Username != "" && cfg.Password != "" {
+		slog.Info("Fetching JWT from Enphase...")
+		token, err := AuthenticateWithEnphase(cfg.Username, cfg.Password, cfg.SerialNumber)
+		if err != nil {
+			return fmt.Errorf("JWT auto-fetch failed: %w", err)
+		}
+		slog.Info("JWT obtained successfully")
+		cfg.JWT = token
+		if persistFn != nil {
+			if err := persistFn(token); err != nil {
+				slog.Error("Failed to persist initial JWT to config file", "error", err)
+			}
+		}
+	}
+
+	// Parse JWT expiry and start proactive refresh if credentials are available.
+	var reconnectCh chan struct{}
+	if cfg.JWT != "" {
+		expiry, err := parseJWTExpiry(cfg.JWT)
+		if err != nil {
+			slog.Warn("Could not parse JWT expiry", "error", err)
+		} else {
+			slog.Info("JWT expires", "at", expiry.Format(time.RFC3339))
+			if cfg.Username == "" || cfg.Password == "" {
+				slog.Warn("No credentials configured; JWT expiry will not be handled automatically")
+			} else {
+				reconnectCh = make(chan struct{}, 1)
+				go jwtRefresher(ctx, cfg, expiry, reconnectCh, AuthenticateWithEnphase, persistFn)
+			}
+		}
+	}
+
+	// Start HTTP server bound to 0.0.0.0 so it is reachable inside Docker.
+	var lastScrapeTime atomic.Int64
+	port := cfg.ExpVarPort
+	if port == 0 {
+		port = 6667
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/debug/vars", expvar.Handler())
+	mux.HandleFunc("/health", healthHandler(&lastScrapeTime, cfg.Interval))
+	srv := &http.Server{
+		Addr:    fmt.Sprintf("0.0.0.0:%d", port),
+		Handler: mux,
+	}
+	go func() {
+		slog.Info("Starting HTTP server", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HTTP server error", "error", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	slog.Info("Starting Envoy Exporter",
+		"go_version", runtime.Version(),
 		"address", cfg.Address,
 		"serial", cfg.SerialNumber,
-		"interval", cfg.Interval)
-	slog.Debug("Writing to Influxdb",
-		"url", cfg.InfluxDB,
-		"bucket", cfg.InfluxDBBucket)
+		"interval_s", cfg.Interval,
+		"source", cfg.SourceTag,
+		"influxdb", cfg.InfluxDB,
+		"influxdb_org", cfg.InfluxDBOrg,
+		"influxdb_bucket", cfg.InfluxDBBucket,
+		"log_level", logLevelFlag,
+		"persist_jwt", persistJWTFlag || cfg.PersistJWT,
+		"tls_insecure_skip_verify", cfg.TLSInsecureSkipVerify)
 
-	// Initialize InfluxDB Client
-	client := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
-	defer client.Close()
-	writeAPI := client.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
+	influxClient := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
+	defer influxClient.Close()
+	writeAPI := influxClient.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
 
-	scrapeLoop(ctx, cfg, writeAPI, defaultClientFactory)
+	scrapeLoop(ctx, cfg, writeAPI, defaultClientFactory, &lastScrapeTime, reconnectCh)
 	return nil
 }

@@ -11,3 +11,9 @@ services:
     # Example environment variables if needed
     # environment:
     #   - TZ=UTC
+    networks:
+      - nginx_proxy_network
+
+networks:
+  nginx_proxy_network:
+    external: true

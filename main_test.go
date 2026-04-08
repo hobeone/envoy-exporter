@@ -2,548 +2,370 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
-	envoy "github.com/loafoe/go-envoy"
+	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// MockEnvoyClient is a mock of EnvoyClient.
-// It is defined in the test file because it's only used for testing.
-type MockEnvoyClient struct {
-	ProductionFunc        func() (*envoy.ProductionResponse, error)
-	InvertersFunc         func() (*[]envoy.Inverter, error)
-	BatteriesFunc         func() (*[]envoy.Battery, error)
-	InvalidateSessionFunc func()
-}
-
-func (m *MockEnvoyClient) Production() (*envoy.ProductionResponse, error) {
-	if m.ProductionFunc != nil {
-		return m.ProductionFunc()
-	}
-	return nil, nil
-}
-
-func (m *MockEnvoyClient) Inverters() (*[]envoy.Inverter, error) {
-	if m.InvertersFunc != nil {
-		return m.InvertersFunc()
-	}
-	return nil, nil
-}
-
-func (m *MockEnvoyClient) Batteries() (*[]envoy.Battery, error) {
-	if m.BatteriesFunc != nil {
-		return m.BatteriesFunc()
-	}
-	return nil, nil
-}
-
-func (m *MockEnvoyClient) InvalidateSession() {
-	if m.InvalidateSessionFunc != nil {
-		m.InvalidateSessionFunc()
-	}
-}
-
-type MockPointWriter struct {
-	WritePointFunc func(ctx context.Context, point ...*influxdb2write.Point) error
-}
-
-func (m *MockPointWriter) WritePoint(ctx context.Context, point ...*influxdb2write.Point) error {
-	if m.WritePointFunc != nil {
-		return m.WritePointFunc(ctx, point...)
-	}
-	return nil
-}
-
-func TestConfigValidate(t *testing.T) {
-	tests := []struct {
-		name    string
-		config  Config
-		wantErr bool
-	}{
-		{
-			name: "Valid Config",
-			config: Config{
-				Address:        "http://localhost",
-				SerialNumber:   "12345",
-				Username:       "user",
-				InfluxDB:       "http://influx",
-				InfluxDBBucket: "bucket",
-				InfluxDBToken:  "token",
-				InfluxDBOrg:    "org",
-			},
-			wantErr: false,
-		},
-		{
-			name: "Valid Config with JWT",
-			config: Config{
-				Address:        "http://localhost",
-				SerialNumber:   "12345",
-				JWT:            "token",
-				InfluxDB:       "http://influx",
-				InfluxDBBucket: "bucket",
-				InfluxDBToken:  "token",
-				InfluxDBOrg:    "org",
-			},
-			wantErr: false,
-		},
-		{
-			name: "Missing Address",
-			config: Config{
-				SerialNumber:   "12345",
-				Username:       "user",
-				InfluxDB:       "http://influx",
-				InfluxDBBucket: "bucket",
-				InfluxDBToken:  "token",
-				InfluxDBOrg:    "org",
-			},
-			wantErr: true,
-		},
-		{
-			name: "Missing Serial",
-			config: Config{
-				Address:        "http://localhost",
-				Username:       "user",
-				InfluxDB:       "http://influx",
-				InfluxDBBucket: "bucket",
-				InfluxDBToken:  "token",
-				InfluxDBOrg:    "org",
-			},
-			wantErr: true,
-		},
-		{
-			name: "Missing Authentication",
-			config: Config{
-				Address:        "http://localhost",
-				SerialNumber:   "12345",
-				InfluxDB:       "http://influx",
-				InfluxDBBucket: "bucket",
-				InfluxDBToken:  "token",
-				InfluxDBOrg:    "org",
-			},
-			wantErr: true,
-		},
-		{
-			name: "Missing InfluxDB",
-			config: Config{
-				Address:        "http://localhost",
-				SerialNumber:   "12345",
-				Username:       "user",
-				InfluxDBBucket: "bucket",
-				InfluxDBToken:  "token",
-				InfluxDBOrg:    "org",
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.config.Validate()
-			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestLoadConfig(t *testing.T) {
-	// Create a temporary config file
-	content := []byte(`
-address: http://localhost:8080
-serial: 123456
-username: admin
-influxdb: http://localhost:8086
-influxdb_token: mytoken
-influxdb_org: myorg
-influxdb_bucket: mybucket
-interval: 10
-`)
-	tmpfile, err := os.CreateTemp("", "config.*.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpfile.Name()) // clean up
-
-	if _, err := tmpfile.Write(content); err != nil {
-		t.Fatal(err)
-	}
-	if err := tmpfile.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := LoadConfig(tmpfile.Name())
-	assert.NoError(t, err)
-	assert.NotNil(t, cfg)
-	assert.Equal(t, "http://localhost:8080", cfg.Address)
-	assert.Equal(t, "123456", cfg.SerialNumber)
-	assert.Equal(t, 10, cfg.Interval)
-}
-
-func TestLineToPoint(t *testing.T) {
-	line := envoy.Line{
-		WNow:       100,
-		ReactPwr:   200,
-		ApprntPwr:  300,
-		RmsCurrent: 400,
-		RmsVoltage: 500,
-	}
-	point := lineToPoint("test-type", line, 1, "test")
-	assert.NotNil(t, point)
-	assert.Equal(t, "test-type-line1", point.Name())
-
-	tags := make(map[string]string)
-	for _, tag := range point.TagList() {
-		tags[tag.Key] = tag.Value
-	}
-	assert.Equal(t, map[string]string{
-		"source":           "test",
-		"measurement-type": "test-type",
-		"line-idx":         "1",
-	}, tags)
-
-	fields := make(map[string]interface{})
-	for _, field := range point.FieldList() {
-		fields[field.Key] = field.Value
-	}
-	assert.Equal(t, map[string]interface{}{
-		"P":     float64(100),
-		"Q":     float64(200),
-		"S":     float64(300),
-		"I_rms": float64(400),
-		"V_rms": float64(500),
-	}, fields)
-}
-
-func TestExtractProductionStats(t *testing.T) {
-	prod := &envoy.ProductionResponse{
-		Production: []envoy.Measurement{
-			{
-				MeasurementType: MeasurementProduction,
-				Lines: []envoy.Line{
-					{WNow: 100},
-				},
-			},
-		},
-		Consumption: []envoy.Measurement{
-			{
-				MeasurementType: MeasurementTotalConsumption,
-				Lines: []envoy.Line{
-					{WNow: 200},
-				},
-			},
-			{
-				MeasurementType: MeasurementNetConsumption,
-				Lines: []envoy.Line{
-					{WNow: 300},
-				},
-			},
-		},
-	}
-	points := extractProductionStats(prod, "test")
-	assert.Len(t, points, 3)
-	assert.Equal(t, "production-line0", points[0].Name())
-	assert.Equal(t, "consumption-line0", points[1].Name())
-	assert.Equal(t, "net-line0", points[2].Name())
-}
-
-func TestExtractInverterStats(t *testing.T) {
-	inverters := &[]envoy.Inverter{
-		{
-			SerialNumber:    "123",
-			LastReportWatts: 100,
-		},
-	}
-	points := extractInverterStats(inverters, "test")
-	assert.Len(t, points, 1)
-	assert.Equal(t, "inverter-production-123", points[0].Name())
-
-	tags := make(map[string]string)
-	for _, tag := range points[0].TagList() {
-		tags[tag.Key] = tag.Value
-	}
-	assert.Equal(t, map[string]string{
-		"source":           "test",
-		"measurement-type": "inverter",
-		"serial":           "123",
-	}, tags)
-
-	fields := make(map[string]interface{})
-	for _, field := range points[0].FieldList() {
-		fields[field.Key] = field.Value
-	}
-	assert.Equal(t, map[string]interface{}{
-		"P": int64(100),
-	}, fields)
-}
-
-func TestExtractBatteryStats(t *testing.T) {
-	batteries := &[]envoy.Battery{
-		{
-			SerialNum:   "456",
-			PercentFull: 80,
-			Temperature: 25,
-		},
-	}
-	points := extractBatteryStats(batteries, "test")
-	assert.Len(t, points, 1)
-	assert.Equal(t, "battery-456", points[0].Name())
-
-	tags := make(map[string]string)
-	for _, tag := range points[0].TagList() {
-		tags[tag.Key] = tag.Value
-	}
-	assert.Equal(t, map[string]string{
-		"source":           "test",
-		"measurement-type": "battery",
-		"serial":           "456",
-	}, tags)
-
-	fields := make(map[string]interface{})
-	for _, field := range points[0].FieldList() {
-		fields[field.Key] = field.Value
-	}
-	assert.Equal(t, map[string]interface{}{
-		"percent-full": int64(80),
-		"temperature":  int64(25),
-	}, fields)
-}
-
-func TestScrape(t *testing.T) {
-	tests := []struct {
-		name           string
-		mockClient     *MockEnvoyClient
-		expectedPoints int
-	}{
-		{
-			name: "successful scrape",
-			mockClient: &MockEnvoyClient{
-				ProductionFunc: func() (*envoy.ProductionResponse, error) {
-					return &envoy.ProductionResponse{
-						Production: []envoy.Measurement{
-							{
-								MeasurementType: MeasurementProduction,
-								Lines:           []envoy.Line{{WNow: 100}},
-							},
-						},
-					}, nil
-				},
-				InvertersFunc: func() (*[]envoy.Inverter, error) {
-					return &[]envoy.Inverter{{
-						SerialNumber:    "123",
-						LastReportWatts: 100,
-					}}, nil
-				},
-				BatteriesFunc: func() (*[]envoy.Battery, error) {
-					return &[]envoy.Battery{{
-						SerialNum:   "456",
-						PercentFull: 80,
-						Temperature: 25,
-					}}, nil
-				},
-			},
-			expectedPoints: 3,
-		},
-		{
-			name: "production error",
-			mockClient: &MockEnvoyClient{
-				ProductionFunc: func() (*envoy.ProductionResponse, error) {
-					return nil, errors.New("production error")
-				},
-			},
-			expectedPoints: 0,
-		},
-		{
-			name: "write error",
-			mockClient: &MockEnvoyClient{
-				ProductionFunc: func() (*envoy.ProductionResponse, error) {
-					return &envoy.ProductionResponse{
-						Production: []envoy.Measurement{
-							{
-								MeasurementType: MeasurementProduction,
-								Lines:           []envoy.Line{{WNow: 100}},
-							},
-						},
-					}, nil
-				},
-			},
-			expectedPoints: 1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			writer := &MockPointWriter{}
-			if tt.name == "write error" {
-				writer.WritePointFunc = func(ctx context.Context, points ...*influxdb2write.Point) error {
-					return errors.New("write error")
-				}
-			}
-			numPoints := scrape(context.Background(), tt.mockClient, writer, "test")
-			assert.Equal(t, tt.expectedPoints, numPoints)
-		})
-	}
-}
-
-func TestScrapeLoop(t *testing.T) {
-	// Setup context that expires quickly
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	// Setup mocks
-	mockClient := &MockEnvoyClient{
-		ProductionFunc: func() (*envoy.ProductionResponse, error) {
-			return &envoy.ProductionResponse{
-				Production: []envoy.Measurement{
-					{
-						MeasurementType: MeasurementProduction,
-						Lines:           []envoy.Line{{WNow: 100}},
-					},
-				},
-			}, nil
-		},
-	}
-
-	pointCount := 0
-	mockWriter := &MockPointWriter{
-		WritePointFunc: func(ctx context.Context, points ...*influxdb2write.Point) error {
-			pointCount += len(points)
-			return nil
-		},
-	}
-
-	// Mock factory
-	mockFactory := func(cfg *Config) (EnvoyClient, error) {
-		return mockClient, nil
-	}
-
-	cfg := &Config{
-		Interval: 1, // 1 second interval (longer than timeout, so likely only one scrape will happen)
-		Address:  "http://mock",
-	}
-
-	// Run scrapeLoop
-	// Since we use a short timeout, it should run once (immediate) and then maybe exit or wait.
-	// The immediate scrape is done before the loop.
-	scrapeLoop(ctx, cfg, mockWriter, mockFactory)
-
-	// Assert that at least one scrape happened
-	assert.Greater(t, pointCount, 0, "Should have written at least one point")
-}
-
-func TestScrapeLoop_Retry(t *testing.T) {
-	// Setup context that expires
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	mockClient := &MockEnvoyClient{}
-	mockWriter := &MockPointWriter{}
-
-	retryCount := 0
-	mockFactory := func(cfg *Config) (EnvoyClient, error) {
-		retryCount++
-		if retryCount < 2 {
-			return nil, errors.New("connection failed")
-		}
-		return mockClient, nil
-	}
-
-	cfg := &Config{
-		Interval:      1,
-		RetryInterval: 1, // 1 second
-		Address:       "http://mock",
-	}
-
-	scrapeLoop(ctx, cfg, mockWriter, mockFactory)
-
-	assert.GreaterOrEqual(t, retryCount, 2, "Should have retried at least once")
-}
-
-func TestRun_Error(t *testing.T) {
-	// Test parsing error
-	err := run([]string{"-invalid"})
-	assert.Error(t, err)
-
-	// Test missing config error
-	err = run([]string{"-config", "nonexistent.yaml"})
-	assert.Error(t, err)
-}
-
-func TestRun_ValidationFail(t *testing.T) {
-	// Create a temporary config file that is valid YAML but fails validation
-	content := []byte(`
-address: http://localhost:8080
-serial: 123456
-`)
-	tmpfile, err := os.CreateTemp("", "config.*.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpfile.Name())
-
-	if _, err := tmpfile.Write(content); err != nil {
-		t.Fatal(err)
-	}
-	if err := tmpfile.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	err = run([]string{"-config", tmpfile.Name()})
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "configuration validation failed")
+// makeTestJWT creates a signed JWT with the given expiry for use in tests.
+func makeTestJWT(exp time.Time) string {
+	claims := jwt.MapClaims{"exp": float64(exp.Unix())}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, _ := token.SignedString([]byte("test-secret"))
+	return signed
 }
 
 func TestAuthenticateWithEnphase(t *testing.T) {
-	// Start a local HTTP server
-	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/login/login" {
-			if req.Method != "POST" {
-				http.Error(rw, "Method Not Allowed", http.StatusMethodNotAllowed)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/login":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			if err := req.ParseForm(); err != nil {
-				http.Error(rw, "Bad Request", http.StatusBadRequest)
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
 				return
 			}
-			if req.FormValue("user[email]") == "user" && req.FormValue("user[password]") == "pass" {
-				rw.WriteHeader(http.StatusOK)
+			if r.FormValue("user[email]") == "user@example.com" && r.FormValue("user[password]") == "pass" {
+				w.WriteHeader(http.StatusOK)
 				return
 			}
-			http.Error(rw, "Unauthorized", http.StatusUnauthorized)
-			return
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "/entrez-auth-token":
+			if r.URL.Query().Get("serial_num") == "12345" {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "mock-jwt-token")
+				return
+			}
+			http.Error(w, "bad request", http.StatusBadRequest)
+		default:
+			http.NotFound(w, r)
 		}
-		if req.URL.Path == "/entrez-auth-token" {
-			query := req.URL.Query()
-			if query.Get("serial_num") == "12345" {
-				rw.WriteHeader(http.StatusOK)
-				rw.Write([]byte("mock-jwt-token"))
-				return
-			}
-			http.Error(rw, "Bad Request", http.StatusBadRequest)
-			return
-		}
-		http.Error(rw, "Not Found", http.StatusNotFound)
 	}))
 	defer server.Close()
 
-	// Redirect AuthenticateWithEnphase to use the mock server
-	originalURL := EnphaseBaseURL
+	origURL := EnphaseBaseURL
 	EnphaseBaseURL = server.URL
-	defer func() { EnphaseBaseURL = originalURL }()
+	defer func() { EnphaseBaseURL = origURL }()
 
-	token, err := AuthenticateWithEnphase("user", "pass", "12345")
-	assert.NoError(t, err)
+	token, err := AuthenticateWithEnphase("user@example.com", "pass", "12345")
+	require.NoError(t, err)
 	assert.Equal(t, "mock-jwt-token", token)
+}
 
-	// Test failure
-	_, err = AuthenticateWithEnphase("wrong", "pass", "12345")
+func TestAuthenticateWithEnphase_LoginFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login/login" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	origURL := EnphaseBaseURL
+	EnphaseBaseURL = server.URL
+	defer func() { EnphaseBaseURL = origURL }()
+
+	_, err := AuthenticateWithEnphase("bad", "creds", "12345")
 	assert.Error(t, err)
+}
+
+func TestAuthenticateWithEnphase_JSONResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/login":
+			w.WriteHeader(http.StatusOK)
+		case "/entrez-auth-token":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"generation_time":1000000,"token":"jwt-from-json","expires_at":9999999}`)
+		}
+	}))
+	defer server.Close()
+
+	origURL := EnphaseBaseURL
+	EnphaseBaseURL = server.URL
+	defer func() { EnphaseBaseURL = origURL }()
+
+	token, err := AuthenticateWithEnphase("user", "pass", "serial")
+	require.NoError(t, err)
+	assert.Equal(t, "jwt-from-json", token)
+}
+
+func TestParseJWTExpiry(t *testing.T) {
+	future := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	raw := makeTestJWT(future)
+
+	expiry, err := parseJWTExpiry(raw)
+	require.NoError(t, err)
+	assert.Equal(t, future, expiry)
+}
+
+func TestParseJWTExpiry_InvalidToken(t *testing.T) {
+	_, err := parseJWTExpiry("not-a-jwt")
+	assert.Error(t, err)
+}
+
+func TestHealthHandler_NoScrapeYet(t *testing.T) {
+	var lastScrape atomic.Int64
+	h := healthHandler(&lastScrape, 5)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
+
+func TestHealthHandler_RecentScrape(t *testing.T) {
+	var lastScrape atomic.Int64
+	lastScrape.Store(time.Now().Unix())
+	h := healthHandler(&lastScrape, 5)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "ok", w.Body.String())
+}
+
+func TestHealthHandler_StaleScrape(t *testing.T) {
+	var lastScrape atomic.Int64
+	// Set last scrape to 60 seconds ago with interval=5 → deadline is 15s → stale.
+	lastScrape.Store(time.Now().Add(-60 * time.Second).Unix())
+	h := healthHandler(&lastScrape, 5)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
+
+func TestJWTRefresher_RefreshesExpiredToken(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Expiry in the past → delay will be 0, refresh fires immediately.
+	expiry := time.Now().Add(-1 * time.Hour)
+	cfg := &Config{
+		Username:      "user",
+		Password:      "pass",
+		SerialNumber:  "12345",
+		RetryInterval: 1,
+	}
+
+	newJWT := makeTestJWT(time.Now().Add(24 * time.Hour))
+	fetchCalled := make(chan struct{}, 1)
+	mockFetch := func(username, password, serial string) (string, error) {
+		fetchCalled <- struct{}{}
+		return newJWT, nil
+	}
+
+	reconnectCh := make(chan struct{}, 1)
+	go jwtRefresher(ctx, cfg, expiry, reconnectCh, mockFetch, nil)
+
+	select {
+	case <-fetchCalled:
+	case <-time.After(time.Second):
+		t.Fatal("JWT refresh was not called")
+	}
+
+	select {
+	case <-reconnectCh:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect signal not sent")
+	}
+
+	assert.Equal(t, newJWT, cfg.JWT)
+}
+
+func TestJWTRefresher_RetriesOnFetchError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	expiry := time.Now().Add(-1 * time.Hour)
+	cfg := &Config{
+		Username:      "user",
+		Password:      "pass",
+		SerialNumber:  "12345",
+		RetryInterval: 1,
+	}
+
+	attempts := 0
+	newJWT := makeTestJWT(time.Now().Add(24 * time.Hour))
+	mockFetch := func(username, password, serial string) (string, error) {
+		attempts++
+		if attempts < 2 {
+			return "", fmt.Errorf("transient error")
+		}
+		return newJWT, nil
+	}
+
+	reconnectCh := make(chan struct{}, 1)
+	go jwtRefresher(ctx, cfg, expiry, reconnectCh, mockFetch, nil)
+
+	// Should eventually succeed after one failure (context allows up to 2s).
+	select {
+	case <-reconnectCh:
+		assert.GreaterOrEqual(t, attempts, 2)
+	case <-ctx.Done():
+		t.Fatal("JWT refresh did not succeed within timeout")
+	}
+}
+
+func TestPersistJWTToConfig_UpdatesExistingField(t *testing.T) {
+	content := []byte(`# Envoy config
+address: https://192.168.1.100
+serial: "12345"
+jwt: old-token
+username: user@example.com
+`)
+	f, err := os.CreateTemp("", "config-*.yaml")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+	_, err = f.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.NoError(t, persistJWTToConfig(f.Name(), "new-token"))
+
+	cfg, err := LoadConfig(f.Name())
+	require.NoError(t, err)
+	assert.Equal(t, "new-token", cfg.JWT)
+
+	// Other fields must be preserved.
+	assert.Equal(t, "https://192.168.1.100", cfg.Address)
+	assert.Equal(t, "12345", cfg.SerialNumber)
+	assert.Equal(t, "user@example.com", cfg.Username)
+}
+
+func TestPersistJWTToConfig_AddsAbsentField(t *testing.T) {
+	// Config with no jwt field — should be added.
+	content := []byte(`address: https://192.168.1.100
+serial: "12345"
+username: user@example.com
+password: secret
+influxdb: http://influxdb:8086
+influxdb_token: tok
+influxdb_org: org
+influxdb_bucket: bucket
+`)
+	f, err := os.CreateTemp("", "config-*.yaml")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+	_, err = f.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.NoError(t, persistJWTToConfig(f.Name(), "brand-new-token"))
+
+	cfg, err := LoadConfig(f.Name())
+	require.NoError(t, err)
+	assert.Equal(t, "brand-new-token", cfg.JWT)
+	assert.Equal(t, "https://192.168.1.100", cfg.Address)
+}
+
+func TestPersistJWTToConfig_FileNotFound(t *testing.T) {
+	err := persistJWTToConfig("/nonexistent/path/config.yaml", "token")
+	assert.Error(t, err)
+}
+
+func TestJWTRefresher_PersistsCalled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	expiry := time.Now().Add(-1 * time.Hour)
+	cfg := &Config{
+		Username:      "user",
+		Password:      "pass",
+		SerialNumber:  "12345",
+		RetryInterval: 1,
+	}
+
+	newJWT := makeTestJWT(time.Now().Add(24 * time.Hour))
+	mockFetch := func(_, _, _ string) (string, error) { return newJWT, nil }
+
+	var persistedToken string
+	mockPersist := func(token string) error {
+		persistedToken = token
+		return nil
+	}
+
+	reconnectCh := make(chan struct{}, 1)
+	go jwtRefresher(ctx, cfg, expiry, reconnectCh, mockFetch, mockPersist)
+
+	select {
+	case <-reconnectCh:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect signal not sent")
+	}
+
+	assert.Equal(t, newJWT, persistedToken)
+}
+
+func TestParseLogLevel(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantLevel slog.Level
+		wantErr   bool
+	}{
+		{"", slog.LevelInfo, false},
+		{"info", slog.LevelInfo, false},
+		{"INFO", slog.LevelInfo, false},
+		{"debug", slog.LevelDebug, false},
+		{"DEBUG", slog.LevelDebug, false},
+		{"warn", slog.LevelWarn, false},
+		{"warning", slog.LevelWarn, false},
+		{"error", slog.LevelError, false},
+		{"ERROR", slog.LevelError, false},
+		{"  debug  ", slog.LevelDebug, false}, // whitespace trimmed
+		{"verbose", slog.LevelInfo, true},
+		{"trace", slog.LevelInfo, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseLogLevel(tt.input)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantLevel, got)
+			}
+		})
+	}
+}
+
+func TestRun_FlagError(t *testing.T) {
+	err := run([]string{"-nonexistent-flag"})
+	assert.Error(t, err)
+}
+
+func TestRun_MissingConfig(t *testing.T) {
+	err := run([]string{"-config", "/nonexistent/path.yaml"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to load config")
+}
+
+func TestRun_ValidationFail(t *testing.T) {
+	content := []byte("address: https://192.168.1.1\nserial: 12345\n")
+	f, err := os.CreateTemp("", "cfg-*.yaml")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+	_, err = f.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	err = run([]string{"-config", f.Name()})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "configuration validation failed")
 }
