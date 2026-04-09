@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,43 +111,6 @@ func TestParseJWTExpiry(t *testing.T) {
 func TestParseJWTExpiry_InvalidToken(t *testing.T) {
 	_, err := parseJWTExpiry("not-a-jwt")
 	assert.Error(t, err)
-}
-
-func TestHealthHandler_NoScrapeYet(t *testing.T) {
-	var lastScrape atomic.Int64
-	h := healthHandler(&lastScrape, 5)
-
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	w := httptest.NewRecorder()
-	h(w, req)
-
-	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
-}
-
-func TestHealthHandler_RecentScrape(t *testing.T) {
-	var lastScrape atomic.Int64
-	lastScrape.Store(time.Now().Unix())
-	h := healthHandler(&lastScrape, 5)
-
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	w := httptest.NewRecorder()
-	h(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "ok", w.Body.String())
-}
-
-func TestHealthHandler_StaleScrape(t *testing.T) {
-	var lastScrape atomic.Int64
-	// Set last scrape to 60 seconds ago with interval=5 → deadline is 15s → stale.
-	lastScrape.Store(time.Now().Add(-60 * time.Second).Unix())
-	h := healthHandler(&lastScrape, 5)
-
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	w := httptest.NewRecorder()
-	h(w, req)
-
-	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 }
 
 func TestJWTRefresher_RefreshesExpiredToken(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
+	"strconv"
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
@@ -58,11 +58,15 @@ type scrapeResult struct {
 	hasErr bool
 }
 
-func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string, t time.Time) *influxdb2write.Point {
-	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", lineType, idx)).
+// lineToPoint builds an InfluxDB point for a single phase line.
+// namePrefix forms the measurement name ("<namePrefix>-line<idx>").
+// typeTag is written as the measurement-type tag value, which may differ from namePrefix
+// (e.g. namePrefix="consumption", typeTag="total-consumption").
+func lineToPoint(namePrefix, typeTag string, line envoy.Line, idx int, sourceTag string, t time.Time) *influxdb2write.Point {
+	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", namePrefix, idx)).
 		AddTag(TagSource, sourceTag).
-		AddTag(TagMeasurementType, lineType).
-		AddTag(TagLineIdx, fmt.Sprintf("%d", idx)).
+		AddTag(TagMeasurementType, typeTag).
+		AddTag(TagLineIdx, strconv.Itoa(idx)).
 		AddField(FieldP, line.WNow).
 		AddField(FieldQ, line.ReactPwr).
 		AddField(FieldS, line.ApprntPwr).
@@ -76,7 +80,7 @@ func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string, t 
 	for _, m := range prod.Production {
 		if m.MeasurementType == MeasurementProduction {
 			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint(MeasurementProduction, line, i, sourceTag, t))
+				ps = append(ps, lineToPoint(MeasurementProduction, MeasurementProduction, line, i, sourceTag, t))
 			}
 		}
 	}
@@ -84,11 +88,11 @@ func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string, t 
 		switch m.MeasurementType {
 		case MeasurementTotalConsumption:
 			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint("consumption", line, i, sourceTag, t))
+				ps = append(ps, lineToPoint("consumption", MeasurementTotalConsumption, line, i, sourceTag, t))
 			}
 		case MeasurementNetConsumption:
 			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint("net", line, i, sourceTag, t))
+				ps = append(ps, lineToPoint("net", MeasurementNetConsumption, line, i, sourceTag, t))
 			}
 		}
 	}
@@ -131,7 +135,7 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	// Capture a single timestamp so all points in this scrape share the same time.
 	scrapeTime := time.Now()
 
-	t := time.Now()
+	t := scrapeTime
 	prod, err := e.Production()
 	dur := time.Since(t)
 	if err != nil {
@@ -170,12 +174,12 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 		slog.Error("Batteries fetch failed", "error", err, "duration", dur)
 		hasErr = true
 	} else {
-		var count int
+		count := 0
 		if batteries != nil {
 			count = len(*batteries)
 		}
 		slog.Debug("Batteries fetch", "duration", dur, "batteries", count)
-		if batteries != nil {
+		if count > 0 {
 			points = append(points, extractBatteryStats(batteries, sourceTag, scrapeTime)...)
 		}
 	}
@@ -219,9 +223,8 @@ func connectWithBackoff(ctx context.Context, cfg *Config, factory ClientFactory,
 }
 
 // scrapeLoop connects to the Envoy gateway and scrapes on a regular interval.
-// lastScrapeTime is updated (Unix seconds) after each error-free scrape.
 // reconnect, if non-nil, triggers a reconnect when it receives a signal (e.g. JWT refresh).
-func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, factory ClientFactory, lastScrapeTime *atomic.Int64, reconnect <-chan struct{}) {
+func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, factory ClientFactory, reconnect <-chan struct{}) {
 	slog.Info("Connecting to Envoy", "address", cfg.Address)
 
 	baseRetry := time.Duration(cfg.RetryInterval) * time.Second
@@ -243,23 +246,9 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, factory 
 	// tickAt is when the triggering tick fired; it anchors the "next in" calculation
 	// so that scrape duration does not skew the reported wait time.
 	doScrapeAt := func(tickAt time.Time) {
-		metricScrapeTotal.Add(1)
 		start := time.Now()
 		result := scrape(ctx, e, writeAPI, cfg.SourceTag)
 		dur := time.Since(start)
-
-		metricLastScrapeDurationMs.Set(dur.Milliseconds())
-		if result.hasErr {
-			metricScrapeErrors.Add(1)
-		} else {
-			// Mark healthy on any error-free scrape, even if no devices reported data.
-			now := time.Now().Unix()
-			lastScrapeTime.Store(now)
-			metricLastScrapeTime.Set(now)
-		}
-		if result.points > 0 {
-			metricPointsWrittenTotal.Add(int64(result.points))
-		}
 
 		nextIn := max(time.Until(tickAt.Add(interval)).Truncate(time.Second), 0)
 		slog.Info("Scrape finished",

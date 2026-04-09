@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,7 +70,7 @@ func TestLineToPoint(t *testing.T) {
 		RmsVoltage: 500,
 	}
 	ts := time.Now()
-	pt := lineToPoint("production", line, 2, "home", ts)
+	pt := lineToPoint(MeasurementProduction, MeasurementProduction, line, 2, "home", ts)
 
 	assert.Equal(t, "production-line2", pt.Name())
 
@@ -116,6 +115,11 @@ func TestExtractProductionStats(t *testing.T) {
 	assert.Equal(t, "production-line1", pts[1].Name())
 	assert.Equal(t, "consumption-line0", pts[2].Name())
 	assert.Equal(t, "net-line0", pts[3].Name())
+
+	// measurement-type tag must match the full type string, not the name prefix.
+	assert.Equal(t, MeasurementProduction, tagMap(pts[0])["measurement-type"])
+	assert.Equal(t, MeasurementTotalConsumption, tagMap(pts[2])["measurement-type"])
+	assert.Equal(t, MeasurementNetConsumption, tagMap(pts[3])["measurement-type"])
 }
 
 func TestExtractProductionStats_IgnoresUnknownTypes(t *testing.T) {
@@ -275,7 +279,7 @@ func TestConnectWithBackoff_CancelledContext(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestScrapeLoop_RunsAndUpdatesLastScrapeTime(t *testing.T) {
+func TestScrapeLoop_RunsAndWritesPoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
@@ -291,12 +295,11 @@ func TestScrapeLoop_RunsAndUpdatesLastScrapeTime(t *testing.T) {
 	writer := &MockPointWriter{}
 	factory := func(_ *Config) (EnvoyClient, error) { return client, nil }
 
-	var lastScrapeTime atomic.Int64
 	cfg := &Config{Interval: 1, RetryInterval: 1}
 
-	scrapeLoop(ctx, cfg, writer, factory, &lastScrapeTime, nil)
+	scrapeLoop(ctx, cfg, writer, factory, nil)
 
-	assert.Greater(t, lastScrapeTime.Load(), int64(0), "last scrape time should be set")
+	assert.NotEmpty(t, writer.Written, "scrape loop should have written points")
 }
 
 func TestScrapeLoop_ConnectionRetry(t *testing.T) {
@@ -313,15 +316,9 @@ func TestScrapeLoop_ConnectionRetry(t *testing.T) {
 		return client, nil
 	}
 
-	var lastScrapeTime atomic.Int64
-	cfg := &Config{Interval: 1, RetryInterval: 0} // 0 → uses 5s default but gets overridden in test
+	cfg := &Config{Interval: 1, RetryInterval: 1}
 
-	// Use a very short base retry for the test
-	// We can't pass base directly to scrapeLoop, but RetryInterval=0 defaults to 5s.
-	// Use 1s RetryInterval so retry finishes within the 2s timeout.
-	cfg.RetryInterval = 1
-
-	scrapeLoop(ctx, cfg, &MockPointWriter{}, factory, &lastScrapeTime, nil)
+	scrapeLoop(ctx, cfg, &MockPointWriter{}, factory, nil)
 
 	assert.GreaterOrEqual(t, attempts, 2)
 }

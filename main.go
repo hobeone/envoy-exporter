@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"expvar"
 	"flag"
 	"fmt"
 	"io"
@@ -17,7 +15,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,15 +26,6 @@ import (
 // EnphaseBaseURL is the base URL for the Enphase Enlighten API.
 // Overridable in tests.
 var EnphaseBaseURL = "https://enlighten.enphaseenergy.com"
-
-// expvar metrics published at /debug/vars.
-var (
-	metricScrapeTotal          = expvar.NewInt("scrape_total")
-	metricScrapeErrors         = expvar.NewInt("scrape_errors")
-	metricPointsWrittenTotal   = expvar.NewInt("points_written_total")
-	metricLastScrapeDurationMs = expvar.NewInt("last_scrape_duration_ms")
-	metricLastScrapeTime       = expvar.NewInt("last_scrape_time")
-)
 
 func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
 	return envoy.NewClient(
@@ -180,6 +168,23 @@ func persistJWTToConfig(path, token string) error {
 // tokenFetcher is a function that obtains a fresh JWT from Enphase.
 type tokenFetcher func(username, password, serial string) (string, error)
 
+// fetchWithRetry calls fetch repeatedly until it succeeds or ctx is cancelled.
+// It waits retryWait between attempts.
+func fetchWithRetry(ctx context.Context, cfg *Config, retryWait time.Duration, fetch tokenFetcher) (string, error) {
+	for {
+		token, err := fetch(cfg.Username, cfg.Password, cfg.SerialNumber)
+		if err == nil {
+			return token, nil
+		}
+		slog.Error("JWT refresh failed; retrying", "error", err)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(retryWait):
+		}
+	}
+}
+
 // jwtRefresher runs in a background goroutine, proactively refreshing the JWT
 // before expiry. On success it updates cfg.JWT, calls persist (if non-nil) to
 // write the new token to the config file, and signals reconnectCh so that
@@ -189,59 +194,48 @@ func jwtRefresher(ctx context.Context, cfg *Config, expiry time.Time, reconnectC
 	if leadTime == 0 {
 		leadTime = 60 * time.Minute
 	}
+	retryWait := time.Duration(cfg.RetryInterval) * time.Second
+	if retryWait == 0 {
+		retryWait = 5 * time.Second
+	}
 
 	for {
 		delay := time.Until(expiry.Add(-leadTime))
 		if delay < 0 {
 			delay = 0
 		}
-
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(delay):
 		}
 
-		// Retry on failure until the context is cancelled.
-		for {
-			newToken, err := fetch(cfg.Username, cfg.Password, cfg.SerialNumber)
-			if err != nil {
-				slog.Error("JWT refresh failed; retrying", "error", err)
-				retryWait := time.Duration(cfg.RetryInterval) * time.Second
-				if retryWait == 0 {
-					retryWait = 5 * time.Second
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(retryWait):
-					continue
-				}
-			}
-
-			cfg.JWT = newToken
-			slog.Info("JWT refreshed successfully")
-
-			if persist != nil {
-				if err := persist(newToken); err != nil {
-					slog.Error("Failed to persist JWT to config file", "error", err)
-				}
-			}
-
-			// Non-blocking send: if a reconnect is already pending, don't queue another.
-			select {
-			case reconnectCh <- struct{}{}:
-			default:
-			}
-
-			newExpiry, err := parseJWTExpiry(newToken)
-			if err != nil {
-				slog.Warn("Could not parse refreshed JWT expiry; refresh disabled", "error", err)
-				return
-			}
-			expiry = newExpiry
-			break
+		newToken, err := fetchWithRetry(ctx, cfg, retryWait, fetch)
+		if err != nil {
+			return // ctx cancelled
 		}
+
+		cfg.JWT = newToken
+		slog.Info("JWT refreshed successfully")
+
+		if persist != nil {
+			if err := persist(newToken); err != nil {
+				slog.Error("Failed to persist JWT to config file", "error", err)
+			}
+		}
+
+		// Non-blocking send: if a reconnect is already pending, don't queue another.
+		select {
+		case reconnectCh <- struct{}{}:
+		default:
+		}
+
+		newExpiry, err := parseJWTExpiry(newToken)
+		if err != nil {
+			slog.Warn("Could not parse refreshed JWT expiry; refresh disabled", "error", err)
+			return
+		}
+		expiry = newExpiry
 	}
 }
 
@@ -259,24 +253,6 @@ func parseLogLevel(s string) (slog.Level, error) {
 		return slog.LevelError, nil
 	default:
 		return slog.LevelInfo, fmt.Errorf("unknown log level %q; use debug, info, warn, or error", s)
-	}
-}
-
-// healthHandler returns 200/ok when scrapes are current, 503 when stale or absent.
-func healthHandler(lastScrapeTime *atomic.Int64, interval int) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		last := lastScrapeTime.Load()
-		if last == 0 {
-			http.Error(w, "no successful scrape yet", http.StatusServiceUnavailable)
-			return
-		}
-		deadline := time.Duration(interval) * time.Second * 3
-		if time.Since(time.Unix(last, 0)) > deadline {
-			http.Error(w, "last scrape too old", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
 	}
 }
 
@@ -380,29 +356,6 @@ func run(args []string) error {
 		}
 	}
 
-	// Start HTTP server bound to 0.0.0.0 so it is reachable inside Docker.
-	var lastScrapeTime atomic.Int64
-	port := cfg.ExpVarPort
-	mux := http.NewServeMux()
-	mux.Handle("/debug/vars", expvar.Handler())
-	mux.HandleFunc("/health", healthHandler(&lastScrapeTime, cfg.Interval))
-	srv := &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", port),
-		Handler: mux,
-	}
-	go func() {
-		slog.Info("Starting HTTP server", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("HTTP server error", "error", err)
-		}
-	}()
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-
 	slog.Info("Starting Envoy Exporter",
 		"go_version", runtime.Version(),
 		"address", cfg.Address,
@@ -419,6 +372,6 @@ func run(args []string) error {
 	defer influxClient.Close()
 	writeAPI := influxClient.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
 
-	scrapeLoop(ctx, cfg, writeAPI, defaultClientFactory, &lastScrapeTime, reconnectCh)
+	scrapeLoop(ctx, cfg, writeAPI, defaultClientFactory, reconnectCh)
 	return nil
 }

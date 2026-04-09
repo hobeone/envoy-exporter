@@ -27,7 +27,6 @@ type Config struct {
 	// Optional
 	SourceTag          string `yaml:"source"`
 	Interval           int    `yaml:"interval"`
-	ExpVarPort         int    `yaml:"expvar_port"`
 	RetryInterval      int    `yaml:"retry_interval"`
 	JWTRefreshLeadTime int    `yaml:"jwt_refresh_lead_time"` // minutes before expiry to refresh; default 60
 	PersistJWT         bool   `yaml:"persist_jwt"`           // write refreshed JWT back to the config file
@@ -71,7 +70,6 @@ func LoadConfig(path string) (*Config, error) {
 
 	cfg := Config{
 		Interval:      30,
-		ExpVarPort:    6666,
 		RetryInterval: 5,
 		LogLevel:      "info",
 	}

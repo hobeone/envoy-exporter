@@ -57,7 +57,6 @@ influxdb_bucket: bucket
 	cfg, err := LoadConfig(f.Name())
 	require.NoError(t, err)
 	assert.Equal(t, 30, cfg.Interval, "default interval")
-	assert.Equal(t, 6666, cfg.ExpVarPort, "default expvar port")
 	assert.Equal(t, 5, cfg.RetryInterval, "default retry interval")
 	assert.Equal(t, "info", cfg.LogLevel, "default log level")
 }
