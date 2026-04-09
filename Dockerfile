@@ -14,7 +14,7 @@ RUN go mod download
 COPY . .
 
 # Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o envoy-exporter main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o envoy-exporter .
 
 # Final stage
 FROM alpine:latest

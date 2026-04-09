@@ -58,7 +58,7 @@ type scrapeResult struct {
 	hasErr bool
 }
 
-func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string) *influxdb2write.Point {
+func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string, t time.Time) *influxdb2write.Point {
 	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", lineType, idx)).
 		AddTag(TagSource, sourceTag).
 		AddTag(TagMeasurementType, lineType).
@@ -68,15 +68,15 @@ func lineToPoint(lineType string, line envoy.Line, idx int, sourceTag string) *i
 		AddField(FieldS, line.ApprntPwr).
 		AddField(FieldIrms, line.RmsCurrent).
 		AddField(FieldVrms, line.RmsVoltage).
-		SetTime(time.Now())
+		SetTime(t)
 }
 
-func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string) []*influxdb2write.Point {
+func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string, t time.Time) []*influxdb2write.Point {
 	var ps []*influxdb2write.Point
 	for _, m := range prod.Production {
 		if m.MeasurementType == MeasurementProduction {
 			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint(MeasurementProduction, line, i, sourceTag))
+				ps = append(ps, lineToPoint(MeasurementProduction, line, i, sourceTag, t))
 			}
 		}
 	}
@@ -84,18 +84,18 @@ func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string) []
 		switch m.MeasurementType {
 		case MeasurementTotalConsumption:
 			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint("consumption", line, i, sourceTag))
+				ps = append(ps, lineToPoint("consumption", line, i, sourceTag, t))
 			}
 		case MeasurementNetConsumption:
 			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint("net", line, i, sourceTag))
+				ps = append(ps, lineToPoint("net", line, i, sourceTag, t))
 			}
 		}
 	}
 	return ps
 }
 
-func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string) []*influxdb2write.Point {
+func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string, t time.Time) []*influxdb2write.Point {
 	ps := make([]*influxdb2write.Point, len(*inverters))
 	for i, inv := range *inverters {
 		ps[i] = influxdb2.NewPointWithMeasurement(fmt.Sprintf("inverter-production-%s", inv.SerialNumber)).
@@ -103,12 +103,12 @@ func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string) []*infl
 			AddTag(TagMeasurementType, MeasurementInverter).
 			AddTag(TagSerial, inv.SerialNumber).
 			AddField(FieldP, inv.LastReportWatts).
-			SetTime(time.Now())
+			SetTime(t)
 	}
 	return ps
 }
 
-func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string) []*influxdb2write.Point {
+func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string, t time.Time) []*influxdb2write.Point {
 	ps := make([]*influxdb2write.Point, len(*batteries))
 	for i, bat := range *batteries {
 		ps[i] = influxdb2.NewPointWithMeasurement(fmt.Sprintf("battery-%s", bat.SerialNum)).
@@ -117,7 +117,7 @@ func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string) []*influx
 			AddTag(TagSerial, bat.SerialNum).
 			AddField(FieldPercentFull, bat.PercentFull).
 			AddField(FieldTemperature, bat.Temperature).
-			SetTime(time.Now())
+			SetTime(t)
 	}
 	return ps
 }
@@ -128,6 +128,9 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	var points []*influxdb2write.Point
 	var hasErr bool
 
+	// Capture a single timestamp so all points in this scrape share the same time.
+	scrapeTime := time.Now()
+
 	t := time.Now()
 	prod, err := e.Production()
 	dur := time.Since(t)
@@ -137,7 +140,7 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	} else {
 		var prodPts []*influxdb2write.Point
 		if prod != nil {
-			prodPts = extractProductionStats(prod, sourceTag)
+			prodPts = extractProductionStats(prod, sourceTag, scrapeTime)
 		}
 		slog.Debug("Production fetch", "duration", dur, "points", len(prodPts))
 		points = append(points, prodPts...)
@@ -156,7 +159,7 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 		}
 		slog.Debug("Inverters fetch", "duration", dur, "inverters", count)
 		if count > 0 {
-			points = append(points, extractInverterStats(inverters, sourceTag)...)
+			points = append(points, extractInverterStats(inverters, sourceTag, scrapeTime)...)
 		}
 	}
 
@@ -173,13 +176,15 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 		}
 		slog.Debug("Batteries fetch", "duration", dur, "batteries", count)
 		if batteries != nil {
-			points = append(points, extractBatteryStats(batteries, sourceTag)...)
+			points = append(points, extractBatteryStats(batteries, sourceTag, scrapeTime)...)
 		}
 	}
 
 	if len(points) > 0 {
+		writeCtx, writeCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer writeCancel()
 		t = time.Now()
-		if err := writeAPI.WritePoint(ctx, points...); err != nil {
+		if err := writeAPI.WritePoint(writeCtx, points...); err != nil {
 			slog.Error("InfluxDB write failed",
 				"error", err,
 				"points", len(points),

@@ -70,7 +70,8 @@ func TestLineToPoint(t *testing.T) {
 		RmsCurrent: 400,
 		RmsVoltage: 500,
 	}
-	pt := lineToPoint("production", line, 2, "home")
+	ts := time.Now()
+	pt := lineToPoint("production", line, 2, "home", ts)
 
 	assert.Equal(t, "production-line2", pt.Name())
 
@@ -109,7 +110,7 @@ func TestExtractProductionStats(t *testing.T) {
 		},
 	}
 
-	pts := extractProductionStats(prod, "test")
+	pts := extractProductionStats(prod, "test", time.Now())
 	require.Len(t, pts, 4)
 	assert.Equal(t, "production-line0", pts[0].Name())
 	assert.Equal(t, "production-line1", pts[1].Name())
@@ -123,7 +124,7 @@ func TestExtractProductionStats_IgnoresUnknownTypes(t *testing.T) {
 			{MeasurementType: "unknown", Lines: []envoy.Line{{WNow: 50}}},
 		},
 	}
-	pts := extractProductionStats(prod, "test")
+	pts := extractProductionStats(prod, "test", time.Now())
 	assert.Empty(t, pts)
 }
 
@@ -132,7 +133,7 @@ func TestExtractInverterStats(t *testing.T) {
 		{SerialNumber: "ABC", LastReportWatts: 250},
 		{SerialNumber: "DEF", LastReportWatts: 300},
 	}
-	pts := extractInverterStats(inverters, "home")
+	pts := extractInverterStats(inverters, "home", time.Now())
 	require.Len(t, pts, 2)
 	assert.Equal(t, "inverter-production-ABC", pts[0].Name())
 	assert.Equal(t, "inverter-production-DEF", pts[1].Name())
@@ -144,7 +145,7 @@ func TestExtractBatteryStats(t *testing.T) {
 	batteries := &[]envoy.Battery{
 		{SerialNum: "BAT1", PercentFull: 80, Temperature: 25},
 	}
-	pts := extractBatteryStats(batteries, "home")
+	pts := extractBatteryStats(batteries, "home", time.Now())
 	require.Len(t, pts, 1)
 	assert.Equal(t, "battery-BAT1", pts[0].Name())
 	assert.Equal(t, "battery", tagMap(pts[0])["measurement-type"])

@@ -52,7 +52,7 @@ func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
 // or a raw JWT string depending on the API version.
 func AuthenticateWithEnphase(username, password, serial string) (string, error) {
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Jar: jar}
+	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
 
 	resp, err := client.PostForm(EnphaseBaseURL+"/login/login", url.Values{
 		"user[email]":    {username},
@@ -383,9 +383,6 @@ func run(args []string) error {
 	// Start HTTP server bound to 0.0.0.0 so it is reachable inside Docker.
 	var lastScrapeTime atomic.Int64
 	port := cfg.ExpVarPort
-	if port == 0 {
-		port = 6667
-	}
 	mux := http.NewServeMux()
 	mux.Handle("/debug/vars", expvar.Handler())
 	mux.HandleFunc("/health", healthHandler(&lastScrapeTime, cfg.Interval))
@@ -416,8 +413,7 @@ func run(args []string) error {
 		"influxdb_org", cfg.InfluxDBOrg,
 		"influxdb_bucket", cfg.InfluxDBBucket,
 		"log_level", logLevelFlag,
-		"persist_jwt", persistJWTFlag || cfg.PersistJWT,
-		"tls_insecure_skip_verify", cfg.TLSInsecureSkipVerify)
+		"persist_jwt", persistJWTFlag || cfg.PersistJWT)
 
 	influxClient := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
 	defer influxClient.Close()

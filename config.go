@@ -25,14 +25,13 @@ type Config struct {
 	InfluxDBBucket string `yaml:"influxdb_bucket"`
 
 	// Optional
-	SourceTag              string `yaml:"source"`
-	Interval               int    `yaml:"interval"`
-	ExpVarPort             int    `yaml:"expvar_port"`
-	RetryInterval          int    `yaml:"retry_interval"`
-	TLSInsecureSkipVerify  bool   `yaml:"tls_insecure_skip_verify"`
-	JWTRefreshLeadTime     int    `yaml:"jwt_refresh_lead_time"` // minutes before expiry to refresh; default 60
-	PersistJWT             bool   `yaml:"persist_jwt"`           // write refreshed JWT back to the config file
-	LogLevel               string `yaml:"log_level"`             // debug, info, warn, error; default info
+	SourceTag          string `yaml:"source"`
+	Interval           int    `yaml:"interval"`
+	ExpVarPort         int    `yaml:"expvar_port"`
+	RetryInterval      int    `yaml:"retry_interval"`
+	JWTRefreshLeadTime int    `yaml:"jwt_refresh_lead_time"` // minutes before expiry to refresh; default 60
+	PersistJWT         bool   `yaml:"persist_jwt"`           // write refreshed JWT back to the config file
+	LogLevel           string `yaml:"log_level"`             // debug, info, warn, error; default info
 }
 
 // Validate returns an error if the configuration is missing required fields.
