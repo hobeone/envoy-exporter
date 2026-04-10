@@ -6,45 +6,38 @@ import (
 	"testing"
 	"time"
 
+	gateway "github.com/hobeone/enphase-gateway"
 	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
-	envoy "github.com/loafoe/go-envoy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // MockEnvoyClient implements EnvoyClient using configurable func fields.
 type MockEnvoyClient struct {
-	ProductionFunc        func() (*envoy.ProductionResponse, error)
-	InvertersFunc         func() (*[]envoy.Inverter, error)
-	BatteriesFunc         func() (*[]envoy.Battery, error)
-	InvalidateSessionFunc func()
+	LiveDataFunc           func(ctx context.Context) (gateway.LiveData, error)
+	InvertersFunc          func(ctx context.Context) ([]gateway.InverterReading, error)
+	TypedMeterReadingsFunc func(ctx context.Context) ([]TypedCTReading, error)
 }
 
-func (m *MockEnvoyClient) Production() (*envoy.ProductionResponse, error) {
-	if m.ProductionFunc != nil {
-		return m.ProductionFunc()
+func (m *MockEnvoyClient) LiveData(ctx context.Context) (gateway.LiveData, error) {
+	if m.LiveDataFunc != nil {
+		return m.LiveDataFunc(ctx)
 	}
-	return nil, nil
+	return gateway.LiveData{}, nil
 }
 
-func (m *MockEnvoyClient) Inverters() (*[]envoy.Inverter, error) {
+func (m *MockEnvoyClient) Inverters(ctx context.Context) ([]gateway.InverterReading, error) {
 	if m.InvertersFunc != nil {
-		return m.InvertersFunc()
+		return m.InvertersFunc(ctx)
 	}
 	return nil, nil
 }
 
-func (m *MockEnvoyClient) Batteries() (*[]envoy.Battery, error) {
-	if m.BatteriesFunc != nil {
-		return m.BatteriesFunc()
+func (m *MockEnvoyClient) TypedMeterReadings(ctx context.Context) ([]TypedCTReading, error) {
+	if m.TypedMeterReadingsFunc != nil {
+		return m.TypedMeterReadingsFunc(ctx)
 	}
 	return nil, nil
-}
-
-func (m *MockEnvoyClient) InvalidateSession() {
-	if m.InvalidateSessionFunc != nil {
-		m.InvalidateSessionFunc()
-	}
 }
 
 // MockPointWriter captures written points for assertion.
@@ -61,203 +54,149 @@ func (m *MockPointWriter) WritePoint(ctx context.Context, point ...*influxdb2wri
 	return nil
 }
 
-// TestLineToPoint is table-driven to cover all three measurement types.
-func TestLineToPoint(t *testing.T) {
-	t.Parallel()
-
-	line := envoy.Line{
-		WNow:       100,
-		ReactPwr:   200,
-		ApprntPwr:  300,
-		RmsCurrent: 400,
-		RmsVoltage: 500,
-	}
-	ts := time.Now()
-
-	tests := []struct {
-		name            string
-		namePrefix      string
-		typeTag         string
-		idx             int
-		wantMeasurement string
-		wantTypeTag     string
-		wantLineIdx     string
-	}{
-		{
-			name:            "production",
-			namePrefix:      MeasurementProduction,
-			typeTag:         MeasurementProduction,
-			idx:             2,
-			wantMeasurement: "production-line2",
-			wantTypeTag:     MeasurementProduction,
-			wantLineIdx:     "2",
+// makeLiveData builds a LiveData value with the given aggregate power readings (milliwatts).
+func makeLiveData(solarMW, battMW, gridMW, loadMW int64) gateway.LiveData {
+	return gateway.LiveData{
+		Meters: gateway.LiveMeters{
+			LastUpdate: time.Now().Unix(),
+			PV:         gateway.MeterSummary{AggPowerMW: solarMW},
+			Storage:    gateway.MeterSummary{AggPowerMW: battMW},
+			Grid:       gateway.MeterSummary{AggPowerMW: gridMW},
+			Load:       gateway.MeterSummary{AggPowerMW: loadMW},
 		},
-		{
-			name:            "consumption",
-			namePrefix:      MeasurementTotalConsumption,
-			typeTag:         MeasurementTotalConsumption,
-			idx:             0,
-			wantMeasurement: "consumption-line0",
-			wantTypeTag:     MeasurementTotalConsumption,
-			wantLineIdx:     "0",
-		},
-		{
-			name:            "net",
-			namePrefix:      MeasurementNetConsumption,
-			typeTag:         MeasurementNetConsumption,
-			idx:             1,
-			wantMeasurement: "net-line1",
-			wantTypeTag:     MeasurementNetConsumption,
-			wantLineIdx:     "1",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			pt := lineToPoint(tt.namePrefix, tt.typeTag, line, tt.idx, "home", ts)
-
-			assert.Equal(t, tt.wantMeasurement, pt.Name())
-
-			tags := tagMap(pt)
-			assert.Equal(t, "home", tags["source"])
-			assert.Equal(t, tt.wantTypeTag, tags["measurement-type"])
-			assert.Equal(t, tt.wantLineIdx, tags["line-idx"])
-
-			fields := fieldMap(pt)
-			assert.Equal(t, float64(100), fields["P"])
-			assert.Equal(t, float64(200), fields["Q"])
-			assert.Equal(t, float64(300), fields["S"])
-			assert.Equal(t, float64(400), fields["I_rms"])
-			assert.Equal(t, float64(500), fields["V_rms"])
-		})
 	}
 }
 
-func TestExtractProductionStats(t *testing.T) {
+func TestExtractLiveDataPoints(t *testing.T) {
 	t.Parallel()
 
-	prod := &envoy.ProductionResponse{
-		Production: []envoy.Measurement{
-			{
-				MeasurementType: MeasurementProduction,
-				Lines:           []envoy.Line{{WNow: 100}, {WNow: 200}},
-			},
+	live := gateway.LiveData{
+		Meters: gateway.LiveMeters{
+			LastUpdate:   time.Now().Unix(),
+			PV:           gateway.MeterSummary{AggPowerMW: 5000000},  // 5000 W solar
+			Storage:      gateway.MeterSummary{AggPowerMW: -2000000}, // -2000 W charging
+			Grid:         gateway.MeterSummary{AggPowerMW: -3000000}, // -3000 W exporting
+			Load:         gateway.MeterSummary{AggPowerMW: 0},
+			EncAggSOC:    85,
+			EncAggEnergy: 10000,
 		},
-		Consumption: []envoy.Measurement{
-			{
-				MeasurementType: MeasurementTotalConsumption,
-				Lines:           []envoy.Line{{WNow: 300}},
+	}
+	pts := extractLiveDataPoints(live, "test", time.Now())
+	require.Len(t, pts, 1)
+	assert.Equal(t, "energy-snapshot", pts[0].Name())
+	assert.Equal(t, "test", tagMap(pts[0])["source"])
+
+	fields := fieldMap(pts[0])
+	assert.Equal(t, 5000.0, fields["solar_w"])
+	assert.Equal(t, -2000.0, fields["battery_w"])
+	assert.Equal(t, -3000.0, fields["grid_w"])
+	assert.Equal(t, int64(85), fields["battery_soc"])
+	assert.Equal(t, int64(10000), fields["battery_wh"])
+	// Derived flow: exporting 3000 W surplus solar to grid.
+	assert.Equal(t, 3000.0, fields["solar_to_grid_w"])
+}
+
+func TestExtractCTPoints(t *testing.T) {
+	t.Parallel()
+
+	readings := []TypedCTReading{
+		{
+			CTReading: gateway.CTReading{
+				Channels: []gateway.CTChannel{
+					{ActivePower: 100, ReactivePower: 10, ApparentPower: 110, Current: 0.5, Voltage: 240},
+					{ActivePower: 200, ReactivePower: 20, ApparentPower: 220, Current: 0.8, Voltage: 240},
+				},
 			},
-			{
-				MeasurementType: MeasurementNetConsumption,
-				Lines:           []envoy.Line{{WNow: 400}},
-			},
+			MeasurementType: MeasurementProduction,
+		},
+		{
+			CTReading:       gateway.CTReading{Channels: []gateway.CTChannel{{ActivePower: 300}}},
+			MeasurementType: MeasurementTotalConsumption,
+		},
+		{
+			CTReading:       gateway.CTReading{Channels: []gateway.CTChannel{{ActivePower: 400}}},
+			MeasurementType: MeasurementNetConsumption,
 		},
 	}
 
-	pts := extractProductionStats(prod, "test", time.Now())
-	require.Len(t, pts, 4)
+	pts := extractCTPoints(readings, "home", time.Now())
+	require.Len(t, pts, 4) // 2 production channels + 1 total-consumption + 1 net-consumption
 
-	// Verify measurement names (the namePrefix).
 	assert.Equal(t, "production-line0", pts[0].Name())
 	assert.Equal(t, "production-line1", pts[1].Name())
 	assert.Equal(t, "consumption-line0", pts[2].Name())
 	assert.Equal(t, "net-line0", pts[3].Name())
 
-	// Verify measurement-type tags match the full constant, not the name prefix.
+	// Measurement-type tag must carry the full constant, not the name prefix.
 	// This is the key invariant: "consumption" prefix → "total-consumption" tag.
 	assert.Equal(t, MeasurementProduction, tagMap(pts[0])["measurement-type"])
-	assert.Equal(t, MeasurementProduction, tagMap(pts[1])["measurement-type"])
 	assert.Equal(t, MeasurementTotalConsumption, tagMap(pts[2])["measurement-type"])
 	assert.Equal(t, MeasurementNetConsumption, tagMap(pts[3])["measurement-type"])
+
+	assert.Equal(t, "home", tagMap(pts[0])["source"])
+	assert.Equal(t, 100.0, fieldMap(pts[0])["P"])
+	assert.Equal(t, 10.0, fieldMap(pts[0])["Q"])
 }
 
-func TestExtractProductionStats_IgnoresUnknownProductionType(t *testing.T) {
+func TestExtractCTPoints_SkipsUnknownType(t *testing.T) {
 	t.Parallel()
 
-	prod := &envoy.ProductionResponse{
-		Production: []envoy.Measurement{
-			{MeasurementType: "unknown", Lines: []envoy.Line{{WNow: 50}}},
+	readings := []TypedCTReading{
+		{
+			CTReading:       gateway.CTReading{Channels: []gateway.CTChannel{{ActivePower: 50}}},
+			MeasurementType: "unknown-type",
 		},
 	}
-	pts := extractProductionStats(prod, "test", time.Now())
+	pts := extractCTPoints(readings, "test", time.Now())
 	assert.Empty(t, pts)
 }
 
-func TestExtractProductionStats_IgnoresUnknownConsumptionType(t *testing.T) {
+func TestExtractInverterPoints(t *testing.T) {
 	t.Parallel()
 
-	prod := &envoy.ProductionResponse{
-		Consumption: []envoy.Measurement{
-			{MeasurementType: "unknown-consumption", Lines: []envoy.Line{{WNow: 50}}},
-		},
-	}
-	pts := extractProductionStats(prod, "test", time.Now())
-	assert.Empty(t, pts)
-}
-
-func TestExtractInverterStats(t *testing.T) {
-	t.Parallel()
-
-	inverters := &[]envoy.Inverter{
+	inverters := []gateway.InverterReading{
 		{SerialNumber: "ABC", LastReportWatts: 250},
 		{SerialNumber: "DEF", LastReportWatts: 300},
 	}
-	pts := extractInverterStats(inverters, "home", time.Now())
+	pts := extractInverterPoints(inverters, "home", time.Now())
 	require.Len(t, pts, 2)
 	assert.Equal(t, "inverter-production-ABC", pts[0].Name())
 	assert.Equal(t, "inverter-production-DEF", pts[1].Name())
-	assert.Equal(t, "inverter", tagMap(pts[0])["measurement-type"])
-	assert.Equal(t, int64(250), fieldMap(pts[0])["P"])
-}
-
-func TestExtractBatteryStats(t *testing.T) {
-	t.Parallel()
-
-	batteries := &[]envoy.Battery{
-		{SerialNum: "BAT1", PercentFull: 80, Temperature: 25},
-	}
-	pts := extractBatteryStats(batteries, "home", time.Now())
-	require.Len(t, pts, 1)
-	assert.Equal(t, "battery-BAT1", pts[0].Name())
-	assert.Equal(t, "battery", tagMap(pts[0])["measurement-type"])
-	assert.Equal(t, "BAT1", tagMap(pts[0])["serial"])
-	assert.Equal(t, int64(80), fieldMap(pts[0])["percent-full"])
-	assert.Equal(t, int64(25), fieldMap(pts[0])["temperature"])
+	assert.Equal(t, MeasurementInverter, tagMap(pts[0])["measurement-type"])
+	assert.Equal(t, "ABC", tagMap(pts[0])["serial"])
+	assert.Equal(t, 250.0, fieldMap(pts[0])["P"])
 }
 
 func TestScrape_AllSources(t *testing.T) {
 	t.Parallel()
 
 	client := &MockEnvoyClient{
-		ProductionFunc: func() (*envoy.ProductionResponse, error) {
-			return &envoy.ProductionResponse{
-				Production: []envoy.Measurement{
-					{MeasurementType: MeasurementProduction, Lines: []envoy.Line{{WNow: 100}}},
-				},
-			}, nil
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return makeLiveData(1000000, 0, 0, 1000000), nil
 		},
-		InvertersFunc: func() (*[]envoy.Inverter, error) {
-			return &[]envoy.Inverter{{SerialNumber: "S1", LastReportWatts: 50}}, nil
+		InvertersFunc: func(_ context.Context) ([]gateway.InverterReading, error) {
+			return []gateway.InverterReading{{SerialNumber: "S1", LastReportWatts: 50}}, nil
 		},
-		BatteriesFunc: func() (*[]envoy.Battery, error) {
-			return &[]envoy.Battery{{SerialNum: "B1", PercentFull: 90}}, nil
+		TypedMeterReadingsFunc: func(_ context.Context) ([]TypedCTReading, error) {
+			return []TypedCTReading{{
+				CTReading:       gateway.CTReading{Channels: []gateway.CTChannel{{ActivePower: 100}}},
+				MeasurementType: MeasurementProduction,
+			}}, nil
 		},
 	}
 	writer := &MockPointWriter{}
 
 	result := scrape(context.Background(), client, writer, "test")
-	assert.Equal(t, 3, result.points)
+	assert.Equal(t, 3, result.points) // 1 energy-snapshot + 1 inverter + 1 CT channel
 	assert.False(t, result.hasErr)
 }
 
-func TestScrape_ProductionError(t *testing.T) {
+func TestScrape_LiveDataError(t *testing.T) {
 	t.Parallel()
 
 	client := &MockEnvoyClient{
-		ProductionFunc: func() (*envoy.ProductionResponse, error) {
-			return nil, errors.New("network error")
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return gateway.LiveData{}, errors.New("network error")
 		},
 	}
 	result := scrape(context.Background(), client, &MockPointWriter{}, "test")
@@ -269,16 +208,12 @@ func TestScrape_WriteError(t *testing.T) {
 	t.Parallel()
 
 	client := &MockEnvoyClient{
-		ProductionFunc: func() (*envoy.ProductionResponse, error) {
-			return &envoy.ProductionResponse{
-				Production: []envoy.Measurement{
-					{MeasurementType: MeasurementProduction, Lines: []envoy.Line{{WNow: 100}}},
-				},
-			}, nil
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return makeLiveData(1000000, 0, 0, 1000000), nil
 		},
 	}
 	writer := &MockPointWriter{
-		WritePointFunc: func(ctx context.Context, point ...*influxdb2write.Point) error {
+		WritePointFunc: func(_ context.Context, _ ...*influxdb2write.Point) error {
 			return errors.New("influxdb unavailable")
 		},
 	}
@@ -291,27 +226,42 @@ func TestScrape_WriteError(t *testing.T) {
 func TestScrape_PartialErrors(t *testing.T) {
 	t.Parallel()
 
-	// Production succeeds, inverters and batteries fail — expect only production points.
+	// LiveData succeeds, inverters and CT meters fail — only snapshot written.
 	client := &MockEnvoyClient{
-		ProductionFunc: func() (*envoy.ProductionResponse, error) {
-			return &envoy.ProductionResponse{
-				Production: []envoy.Measurement{
-					{MeasurementType: MeasurementProduction, Lines: []envoy.Line{{WNow: 100}}},
-				},
-			}, nil
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return makeLiveData(1000000, 0, 0, 1000000), nil
 		},
-		InvertersFunc: func() (*[]envoy.Inverter, error) {
+		InvertersFunc: func(_ context.Context) ([]gateway.InverterReading, error) {
 			return nil, errors.New("inverter error")
 		},
-		BatteriesFunc: func() (*[]envoy.Battery, error) {
-			return nil, errors.New("battery error")
+		TypedMeterReadingsFunc: func(_ context.Context) ([]TypedCTReading, error) {
+			return nil, errors.New("ct error")
+		},
+	}
+	writer := &MockPointWriter{}
+
+	result := scrape(context.Background(), client, writer, "test")
+	assert.Equal(t, 1, result.points) // only the energy-snapshot point
+	assert.True(t, result.hasErr)
+}
+
+func TestScrape_CTNotFound(t *testing.T) {
+	t.Parallel()
+
+	// CT returns 404 (no CTs installed) — should not be counted as an error.
+	client := &MockEnvoyClient{
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return makeLiveData(1000000, 0, 0, 1000000), nil
+		},
+		TypedMeterReadingsFunc: func(_ context.Context) ([]TypedCTReading, error) {
+			return nil, &gateway.Error{StatusCode: 404, Endpoint: "/ivp/meters/readings"}
 		},
 	}
 	writer := &MockPointWriter{}
 
 	result := scrape(context.Background(), client, writer, "test")
 	assert.Equal(t, 1, result.points)
-	assert.True(t, result.hasErr)
+	assert.False(t, result.hasErr, "404 from CT endpoint should not be treated as an error")
 }
 
 func TestConnectWithBackoff_ImmediateSuccess(t *testing.T) {
@@ -345,8 +295,6 @@ func TestConnectWithBackoff_RetriesThenSucceeds(t *testing.T) {
 }
 
 // TestConnectWithBackoff_BackoffCap verifies that the delay is capped at maxDelay.
-// With base=2ms and maxDelay=3ms, the progression is: wait 2ms (backoff→3ms), wait 3ms,
-// wait 3ms... rather than the uncapped 2ms, 4ms, 8ms, 16ms.
 func TestConnectWithBackoff_BackoffCap(t *testing.T) {
 	t.Parallel()
 
@@ -390,12 +338,8 @@ func TestScrapeLoop_RunsAndWritesPoints(t *testing.T) {
 	defer cancel()
 
 	client := &MockEnvoyClient{
-		ProductionFunc: func() (*envoy.ProductionResponse, error) {
-			return &envoy.ProductionResponse{
-				Production: []envoy.Measurement{
-					{MeasurementType: MeasurementProduction, Lines: []envoy.Line{{WNow: 100}}},
-				},
-			}, nil
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return makeLiveData(1000000, 0, 0, 1000000), nil
 		},
 	}
 	writer := &MockPointWriter{}

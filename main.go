@@ -2,93 +2,93 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/http/cookiejar"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	gateway "github.com/hobeone/enphase-gateway"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
-	envoy "github.com/loafoe/go-envoy"
 	yaml "gopkg.in/yaml.v3"
 )
 
-// EnphaseBaseURL is the base URL for the Enphase Enlighten API.
-// Overridable in tests.
-var EnphaseBaseURL = "https://enlighten.enphaseenergy.com"
-
-func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
-	return envoy.NewClient(
-		cfg.Username, cfg.Password, cfg.SerialNumber,
-		envoy.WithGatewayAddress(cfg.Address),
-		envoy.WithJWT(cfg.JWT),
-	)
+// gatewayAdapter wraps a gateway.Client and implements EnvoyClient.
+// It caches the EID→MeasurementType mapping from the meter configuration
+// on the first call to TypedMeterReadings.
+type gatewayAdapter struct {
+	client     *gateway.Client
+	mu         sync.Mutex
+	meterTypes map[int64]string // EID → MeasurementType; nil until first load
 }
 
-// AuthenticateWithEnphase fetches a JWT from Enphase Enlighten using
-// username/password credentials. The response may be JSON {"token": "..."}
-// or a raw JWT string depending on the API version.
+func (a *gatewayAdapter) LiveData(ctx context.Context) (gateway.LiveData, error) {
+	return a.client.LiveData(ctx)
+}
+
+func (a *gatewayAdapter) Inverters(ctx context.Context) ([]gateway.InverterReading, error) {
+	return a.client.Inverters(ctx)
+}
+
+func (a *gatewayAdapter) TypedMeterReadings(ctx context.Context) ([]TypedCTReading, error) {
+	a.mu.Lock()
+	meterTypes := a.meterTypes
+	a.mu.Unlock()
+
+	if meterTypes == nil {
+		meters, err := a.client.Meters(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("fetch meter config: %w", err)
+		}
+		meterTypes = make(map[int64]string, len(meters))
+		for _, m := range meters {
+			meterTypes[m.EID] = m.MeasurementType
+		}
+		a.mu.Lock()
+		a.meterTypes = meterTypes
+		a.mu.Unlock()
+	}
+
+	readings, err := a.client.MeterReadings(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]TypedCTReading, len(readings))
+	for i, r := range readings {
+		result[i] = TypedCTReading{
+			CTReading:       r,
+			MeasurementType: meterTypes[r.EID],
+		}
+	}
+	return result, nil
+}
+
+func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
+	client := gateway.NewClient(cfg.Address, cfg.JWT)
+	return &gatewayAdapter{client: client}, nil
+}
+
+// AuthenticateWithEnphase fetches a JWT from Enphase cloud using username/password
+// credentials. Delegates to gateway.FetchJWT which implements the two-step
+// Enlighten login + Entrez token exchange documented in the IQ Gateway API spec.
 func AuthenticateWithEnphase(username, password, serial string) (string, error) {
-	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
-
-	resp, err := client.PostForm(EnphaseBaseURL+"/login/login", url.Values{
-		"user[email]":    {username},
-		"user[password]": {password},
-	})
+	tr, err := gateway.FetchJWT(context.Background(), username, password, serial)
 	if err != nil {
-		return "", fmt.Errorf("login failed: %w", err)
+		return "", err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("login failed with status: %s", resp.Status)
-	}
-
-	tokenURL := fmt.Sprintf("%s/entrez-auth-token?serial_num=%s", EnphaseBaseURL, serial)
-	resp2, err := client.Get(tokenURL)
-	if err != nil {
-		return "", fmt.Errorf("failed to get token: %w", err)
-	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("get token failed with status: %s", resp2.Status)
-	}
-
-	body, err := io.ReadAll(resp2.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read token response: %w", err)
-	}
-
-	// Production API returns JSON; test servers may return raw string.
-	raw := strings.TrimSpace(string(body))
-	if strings.HasPrefix(raw, "{") {
-		var tr struct {
-			Token string `json:"token"`
-		}
-		if jsonErr := json.Unmarshal(body, &tr); jsonErr == nil && tr.Token != "" {
-			return tr.Token, nil
-		}
-	}
-	return raw, nil
+	return tr.Token, nil
 }
 
 // parseJWTExpiry extracts the expiry time from a raw JWT without signature verification.
 func parseJWTExpiry(rawToken string) (time.Time, error) {
-	t, err := envoy.GetJWTExpired(rawToken)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return *t, nil
+	return gateway.ParseExpiry(rawToken)
 }
 
 // persistJWTToConfig updates the jwt field in the YAML config file at path

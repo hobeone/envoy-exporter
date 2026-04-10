@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
+	gateway "github.com/hobeone/enphase-gateway"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
-	envoy "github.com/loafoe/go-envoy"
 )
 
 const (
@@ -18,7 +18,6 @@ const (
 	MeasurementTotalConsumption = "total-consumption"
 	MeasurementNetConsumption   = "net-consumption"
 	MeasurementInverter         = "inverter"
-	MeasurementBattery          = "battery"
 
 	// Tag keys.
 	TagSource          = "source"
@@ -27,21 +26,26 @@ const (
 	TagSerial          = "serial"
 
 	// Field keys.
-	FieldP           = "P"
-	FieldQ           = "Q"
-	FieldS           = "S"
-	FieldIrms        = "I_rms"
-	FieldVrms        = "V_rms"
-	FieldPercentFull = "percent-full"
-	FieldTemperature = "temperature"
+	FieldP    = "P"
+	FieldQ    = "Q"
+	FieldS    = "S"
+	FieldIrms = "I_rms"
+	FieldVrms = "V_rms"
 )
+
+// TypedCTReading pairs a raw CT reading with the measurement type
+// (production, net-consumption, total-consumption) inferred from the
+// gateway's meter configuration.
+type TypedCTReading struct {
+	gateway.CTReading
+	MeasurementType string
+}
 
 // EnvoyClient defines the methods for interacting with the Envoy gateway.
 type EnvoyClient interface {
-	Production() (*envoy.ProductionResponse, error)
-	Inverters() (*[]envoy.Inverter, error)
-	Batteries() (*[]envoy.Battery, error)
-	InvalidateSession()
+	LiveData(ctx context.Context) (gateway.LiveData, error)
+	Inverters(ctx context.Context) ([]gateway.InverterReading, error)
+	TypedMeterReadings(ctx context.Context) ([]TypedCTReading, error)
 }
 
 // PointWriter abstracts the InfluxDB blocking write API for testability.
@@ -58,68 +62,77 @@ type scrapeResult struct {
 	hasErr bool
 }
 
-// lineToPoint builds an InfluxDB point for a single phase line.
-// namePrefix forms the measurement name ("<namePrefix>-line<idx>").
-// typeTag is written as the measurement-type tag value.
-func lineToPoint(namePrefix, typeTag string, line envoy.Line, idx int, sourceTag string, t time.Time) *influxdb2write.Point {
+// extractLiveDataPoints converts a LiveData response into a single energy-snapshot
+// InfluxDB point capturing solar/battery/grid/load flows and battery state.
+func extractLiveDataPoints(live gateway.LiveData, sourceTag string, t time.Time) []*influxdb2write.Point {
+	snap := gateway.SnapshotFromLiveData(live)
+	pt := influxdb2.NewPointWithMeasurement("energy-snapshot").
+		AddTag(TagSource, sourceTag).
+		AddField("solar_w", snap.SolarW).
+		AddField("battery_w", snap.BatteryW).
+		AddField("grid_w", snap.GridW).
+		AddField("load_w", snap.LoadW).
+		AddField("battery_soc", snap.BatterySOC).
+		AddField("battery_wh", snap.BatteryWh).
+		AddField("solar_to_load_w", snap.SolarToLoad).
+		AddField("solar_to_grid_w", snap.SolarToGrid).
+		AddField("solar_to_batt_w", snap.SolarToBatt).
+		AddField("grid_to_load_w", snap.GridToLoad).
+		AddField("batt_to_load_w", snap.BattToLoad).
+		SetTime(t)
+	return []*influxdb2write.Point{pt}
+}
+
+// ctChannelToPoint builds an InfluxDB point for a single CT phase channel.
+func ctChannelToPoint(namePrefix, typeTag string, ch gateway.CTChannel, idx int, sourceTag string, t time.Time) *influxdb2write.Point {
 	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", namePrefix, idx)).
 		AddTag(TagSource, sourceTag).
 		AddTag(TagMeasurementType, typeTag).
 		AddTag(TagLineIdx, strconv.Itoa(idx)).
-		AddField(FieldP, line.WNow).
-		AddField(FieldQ, line.ReactPwr).
-		AddField(FieldS, line.ApprntPwr).
-		AddField(FieldIrms, line.RmsCurrent).
-		AddField(FieldVrms, line.RmsVoltage).
+		AddField(FieldP, ch.ActivePower).
+		AddField(FieldQ, ch.ReactivePower).
+		AddField(FieldS, ch.ApparentPower).
+		AddField(FieldIrms, ch.Current).
+		AddField(FieldVrms, ch.Voltage).
 		SetTime(t)
 }
 
-func extractProductionStats(prod *envoy.ProductionResponse, sourceTag string, t time.Time) []*influxdb2write.Point {
+// extractCTPoints converts typed CT readings into per-phase InfluxDB points.
+// Measurement-name prefixes follow the existing InfluxDB schema:
+//
+//	"production"        → production-line<N>
+//	"total-consumption" → consumption-line<N>
+//	"net-consumption"   → net-line<N>
+func extractCTPoints(readings []TypedCTReading, sourceTag string, t time.Time) []*influxdb2write.Point {
 	var ps []*influxdb2write.Point
-	for _, m := range prod.Production {
-		if m.MeasurementType == MeasurementProduction {
-			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint(MeasurementProduction, MeasurementProduction, line, i, sourceTag, t))
-			}
-		}
-	}
-	for _, m := range prod.Consumption {
-		switch m.MeasurementType {
+	for _, r := range readings {
+		var namePrefix string
+		switch r.MeasurementType {
+		case MeasurementProduction:
+			namePrefix = MeasurementProduction
 		case MeasurementTotalConsumption:
-			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint("consumption", MeasurementTotalConsumption, line, i, sourceTag, t))
-			}
+			namePrefix = "consumption"
 		case MeasurementNetConsumption:
-			for i, line := range m.Lines {
-				ps = append(ps, lineToPoint("net", MeasurementNetConsumption, line, i, sourceTag, t))
-			}
+			namePrefix = "net"
+		default:
+			continue // unknown type; skip
+		}
+		for i, ch := range r.Channels {
+			ps = append(ps, ctChannelToPoint(namePrefix, r.MeasurementType, ch, i, sourceTag, t))
 		}
 	}
 	return ps
 }
 
-func extractInverterStats(inverters *[]envoy.Inverter, sourceTag string, t time.Time) []*influxdb2write.Point {
-	ps := make([]*influxdb2write.Point, len(*inverters))
-	for i, inv := range *inverters {
+// extractInverterPoints builds one InfluxDB point per microinverter.
+func extractInverterPoints(inverters []gateway.InverterReading, sourceTag string, t time.Time) []*influxdb2write.Point {
+	ps := make([]*influxdb2write.Point, len(inverters))
+	for i, inv := range inverters {
 		ps[i] = influxdb2.NewPointWithMeasurement(fmt.Sprintf("inverter-production-%s", inv.SerialNumber)).
 			AddTag(TagSource, sourceTag).
 			AddTag(TagMeasurementType, MeasurementInverter).
 			AddTag(TagSerial, inv.SerialNumber).
-			AddField(FieldP, inv.LastReportWatts).
-			SetTime(t)
-	}
-	return ps
-}
-
-func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string, t time.Time) []*influxdb2write.Point {
-	ps := make([]*influxdb2write.Point, len(*batteries))
-	for i, bat := range *batteries {
-		ps[i] = influxdb2.NewPointWithMeasurement(fmt.Sprintf("battery-%s", bat.SerialNum)).
-			AddTag(TagSource, sourceTag).
-			AddTag(TagMeasurementType, MeasurementBattery).
-			AddTag(TagSerial, bat.SerialNum).
-			AddField(FieldPercentFull, bat.PercentFull).
-			AddField(FieldTemperature, bat.Temperature).
+			AddField(FieldP, float64(inv.LastReportWatts)).
 			SetTime(t)
 	}
 	return ps
@@ -148,6 +161,7 @@ func logPoint(pt *influxdb2write.Point) {
 
 // scrape fetches data from all Envoy endpoints and writes points to InfluxDB.
 // Errors from individual endpoints are logged but do not abort the scrape.
+// A 404 from the CT meter endpoint is treated as a non-error (no CTs installed).
 func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag string) scrapeResult {
 	var points []*influxdb2write.Point
 	var hasErr bool
@@ -156,51 +170,43 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	scrapeTime := time.Now()
 
 	t := scrapeTime
-	prod, err := e.Production()
+	live, err := e.LiveData(ctx)
 	dur := time.Since(t)
 	if err != nil {
-		slog.Error("Production fetch failed", "error", err, "duration", dur)
+		slog.Error("LiveData fetch failed", "error", err, "duration", dur)
 		hasErr = true
 	} else {
-		var prodPts []*influxdb2write.Point
-		if prod != nil {
-			prodPts = extractProductionStats(prod, sourceTag, scrapeTime)
-		}
-		slog.Debug("Production fetch", "duration", dur, "points", len(prodPts))
-		points = append(points, prodPts...)
+		pts := extractLiveDataPoints(live, sourceTag, scrapeTime)
+		slog.Debug("LiveData fetch", "duration", dur, "points", len(pts))
+		points = append(points, pts...)
 	}
 
 	t = time.Now()
-	inverters, err := e.Inverters()
+	ctReadings, err := e.TypedMeterReadings(ctx)
+	dur = time.Since(t)
+	if err != nil {
+		if gateway.IsNotFound(err) {
+			slog.Debug("No CT meters installed; skipping meter readings")
+		} else {
+			slog.Error("MeterReadings fetch failed", "error", err, "duration", dur)
+			hasErr = true
+		}
+	} else {
+		pts := extractCTPoints(ctReadings, sourceTag, scrapeTime)
+		slog.Debug("MeterReadings fetch", "duration", dur, "points", len(pts))
+		points = append(points, pts...)
+	}
+
+	t = time.Now()
+	inverters, err := e.Inverters(ctx)
 	dur = time.Since(t)
 	if err != nil {
 		slog.Error("Inverters fetch failed", "error", err, "duration", dur)
 		hasErr = true
 	} else {
-		var count int
-		if inverters != nil {
-			count = len(*inverters)
-		}
-		slog.Debug("Inverters fetch", "duration", dur, "inverters", count)
-		if count > 0 {
-			points = append(points, extractInverterStats(inverters, sourceTag, scrapeTime)...)
-		}
-	}
-
-	t = time.Now()
-	batteries, err := e.Batteries()
-	dur = time.Since(t)
-	if err != nil {
-		slog.Error("Batteries fetch failed", "error", err, "duration", dur)
-		hasErr = true
-	} else {
-		count := 0
-		if batteries != nil {
-			count = len(*batteries)
-		}
-		slog.Debug("Batteries fetch", "duration", dur, "batteries", count)
-		if count > 0 {
-			points = append(points, extractBatteryStats(batteries, sourceTag, scrapeTime)...)
+		slog.Debug("Inverters fetch", "duration", dur, "inverters", len(inverters))
+		if len(inverters) > 0 {
+			points = append(points, extractInverterPoints(inverters, sourceTag, scrapeTime)...)
 		}
 	}
 

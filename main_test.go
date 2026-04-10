@@ -12,6 +12,7 @@ import (
 	"time"
 
 	jwt "github.com/golang-jwt/jwt/v4"
+	gateway "github.com/hobeone/enphase-gateway"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,12 +26,12 @@ func makeTestJWT(exp time.Time) string {
 }
 
 // TestAuthenticateWithEnphase tests cannot be parallelised: they write to the
-// package-level EnphaseBaseURL variable, which would race if tests ran concurrently.
+// gateway package-level URL variables, which would race if tests ran concurrently.
 
 func TestAuthenticateWithEnphase(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/login/login":
+		case "/login/login.json":
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -40,26 +41,32 @@ func TestAuthenticateWithEnphase(t *testing.T) {
 				return
 			}
 			if r.FormValue("user[email]") == "user@example.com" && r.FormValue("user[password]") == "pass" {
-				w.WriteHeader(http.StatusOK)
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"session_id":"test-session"}`)
 				return
 			}
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
-		case "/entrez-auth-token":
-			if r.URL.Query().Get("serial_num") == "12345" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, "mock-jwt-token")
+		case "/tokens":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			http.Error(w, "bad request", http.StatusBadRequest)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "mock-jwt-token")
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	origURL := EnphaseBaseURL
-	EnphaseBaseURL = server.URL
-	defer func() { EnphaseBaseURL = origURL }()
+	origEnlighten := gateway.EnlightenBaseURL
+	origEntrez := gateway.EntrezBaseURL
+	gateway.EnlightenBaseURL = server.URL
+	gateway.EntrezBaseURL = server.URL
+	defer func() {
+		gateway.EnlightenBaseURL = origEnlighten
+		gateway.EntrezBaseURL = origEntrez
+	}()
 
 	token, err := AuthenticateWithEnphase("user@example.com", "pass", "12345")
 	require.NoError(t, err)
@@ -68,15 +75,20 @@ func TestAuthenticateWithEnphase(t *testing.T) {
 
 func TestAuthenticateWithEnphase_LoginFails(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/login/login" {
+		if r.URL.Path == "/login/login.json" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		}
 	}))
 	defer server.Close()
 
-	origURL := EnphaseBaseURL
-	EnphaseBaseURL = server.URL
-	defer func() { EnphaseBaseURL = origURL }()
+	origEnlighten := gateway.EnlightenBaseURL
+	origEntrez := gateway.EntrezBaseURL
+	gateway.EnlightenBaseURL = server.URL
+	gateway.EntrezBaseURL = server.URL
+	defer func() {
+		gateway.EnlightenBaseURL = origEnlighten
+		gateway.EntrezBaseURL = origEntrez
+	}()
 
 	_, err := AuthenticateWithEnphase("bad", "creds", "12345")
 	assert.Error(t, err)
@@ -85,18 +97,24 @@ func TestAuthenticateWithEnphase_LoginFails(t *testing.T) {
 func TestAuthenticateWithEnphase_JSONResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/login/login":
-			w.WriteHeader(http.StatusOK)
-		case "/entrez-auth-token":
+		case "/login/login.json":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"session_id":"test-session"}`)
+		case "/tokens":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"generation_time":1000000,"token":"jwt-from-json","expires_at":9999999}`)
 		}
 	}))
 	defer server.Close()
 
-	origURL := EnphaseBaseURL
-	EnphaseBaseURL = server.URL
-	defer func() { EnphaseBaseURL = origURL }()
+	origEnlighten := gateway.EnlightenBaseURL
+	origEntrez := gateway.EntrezBaseURL
+	gateway.EnlightenBaseURL = server.URL
+	gateway.EntrezBaseURL = server.URL
+	defer func() {
+		gateway.EnlightenBaseURL = origEnlighten
+		gateway.EntrezBaseURL = origEntrez
+	}()
 
 	token, err := AuthenticateWithEnphase("user", "pass", "serial")
 	require.NoError(t, err)
