@@ -9,6 +9,7 @@ import (
 )
 
 func TestLoadConfig(t *testing.T) {
+	t.Parallel()
 	content := []byte(`
 address: https://192.168.1.100
 serial: 123456
@@ -37,6 +38,7 @@ interval: 10
 }
 
 func TestLoadConfig_Defaults(t *testing.T) {
+	t.Parallel()
 	content := []byte(`
 address: https://192.168.1.100
 serial: 123456
@@ -62,11 +64,13 @@ influxdb_bucket: bucket
 }
 
 func TestLoadConfig_MissingFile(t *testing.T) {
+	t.Parallel()
 	_, err := LoadConfig("/nonexistent/path.yaml")
 	assert.Error(t, err)
 }
 
 func TestConfigValidate(t *testing.T) {
+	t.Parallel()
 	base := Config{
 		Address:        "https://192.168.1.100",
 		SerialNumber:   "12345",
@@ -159,6 +163,7 @@ func TestConfigValidate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			cfg := base // copy
 			if tt.mutate != nil {
 				tt.mutate(&cfg)

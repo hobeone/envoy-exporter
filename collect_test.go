@@ -61,7 +61,10 @@ func (m *MockPointWriter) WritePoint(ctx context.Context, point ...*influxdb2wri
 	return nil
 }
 
+// TestLineToPoint is table-driven to cover all three measurement types.
 func TestLineToPoint(t *testing.T) {
+	t.Parallel()
+
 	line := envoy.Line{
 		WNow:       100,
 		ReactPwr:   200,
@@ -70,26 +73,70 @@ func TestLineToPoint(t *testing.T) {
 		RmsVoltage: 500,
 	}
 	ts := time.Now()
-	pt := lineToPoint(MeasurementProduction, MeasurementProduction, line, 2, "home", ts)
 
-	assert.Equal(t, "production-line2", pt.Name())
+	tests := []struct {
+		name            string
+		namePrefix      string
+		typeTag         string
+		idx             int
+		wantMeasurement string
+		wantTypeTag     string
+		wantLineIdx     string
+	}{
+		{
+			name:            "production",
+			namePrefix:      MeasurementProduction,
+			typeTag:         MeasurementProduction,
+			idx:             2,
+			wantMeasurement: "production-line2",
+			wantTypeTag:     MeasurementProduction,
+			wantLineIdx:     "2",
+		},
+		{
+			name:            "consumption",
+			namePrefix:      MeasurementTotalConsumption,
+			typeTag:         MeasurementTotalConsumption,
+			idx:             0,
+			wantMeasurement: "consumption-line0",
+			wantTypeTag:     MeasurementTotalConsumption,
+			wantLineIdx:     "0",
+		},
+		{
+			name:            "net",
+			namePrefix:      MeasurementNetConsumption,
+			typeTag:         MeasurementNetConsumption,
+			idx:             1,
+			wantMeasurement: "net-line1",
+			wantTypeTag:     MeasurementNetConsumption,
+			wantLineIdx:     "1",
+		},
+	}
 
-	tags := tagMap(pt)
-	assert.Equal(t, map[string]string{
-		"source":           "home",
-		"measurement-type": "production",
-		"line-idx":         "2",
-	}, tags)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pt := lineToPoint(tt.namePrefix, tt.typeTag, line, tt.idx, "home", ts)
 
-	fields := fieldMap(pt)
-	assert.Equal(t, float64(100), fields["P"])
-	assert.Equal(t, float64(200), fields["Q"])
-	assert.Equal(t, float64(300), fields["S"])
-	assert.Equal(t, float64(400), fields["I_rms"])
-	assert.Equal(t, float64(500), fields["V_rms"])
+			assert.Equal(t, tt.wantMeasurement, pt.Name())
+
+			tags := tagMap(pt)
+			assert.Equal(t, "home", tags["source"])
+			assert.Equal(t, tt.wantTypeTag, tags["measurement-type"])
+			assert.Equal(t, tt.wantLineIdx, tags["line-idx"])
+
+			fields := fieldMap(pt)
+			assert.Equal(t, float64(100), fields["P"])
+			assert.Equal(t, float64(200), fields["Q"])
+			assert.Equal(t, float64(300), fields["S"])
+			assert.Equal(t, float64(400), fields["I_rms"])
+			assert.Equal(t, float64(500), fields["V_rms"])
+		})
+	}
 }
 
 func TestExtractProductionStats(t *testing.T) {
+	t.Parallel()
+
 	prod := &envoy.ProductionResponse{
 		Production: []envoy.Measurement{
 			{
@@ -111,18 +158,24 @@ func TestExtractProductionStats(t *testing.T) {
 
 	pts := extractProductionStats(prod, "test", time.Now())
 	require.Len(t, pts, 4)
+
+	// Verify measurement names (the namePrefix).
 	assert.Equal(t, "production-line0", pts[0].Name())
 	assert.Equal(t, "production-line1", pts[1].Name())
 	assert.Equal(t, "consumption-line0", pts[2].Name())
 	assert.Equal(t, "net-line0", pts[3].Name())
 
-	// measurement-type tag must match the full type string, not the name prefix.
+	// Verify measurement-type tags match the full constant, not the name prefix.
+	// This is the key invariant: "consumption" prefix → "total-consumption" tag.
 	assert.Equal(t, MeasurementProduction, tagMap(pts[0])["measurement-type"])
+	assert.Equal(t, MeasurementProduction, tagMap(pts[1])["measurement-type"])
 	assert.Equal(t, MeasurementTotalConsumption, tagMap(pts[2])["measurement-type"])
 	assert.Equal(t, MeasurementNetConsumption, tagMap(pts[3])["measurement-type"])
 }
 
-func TestExtractProductionStats_IgnoresUnknownTypes(t *testing.T) {
+func TestExtractProductionStats_IgnoresUnknownProductionType(t *testing.T) {
+	t.Parallel()
+
 	prod := &envoy.ProductionResponse{
 		Production: []envoy.Measurement{
 			{MeasurementType: "unknown", Lines: []envoy.Line{{WNow: 50}}},
@@ -132,7 +185,21 @@ func TestExtractProductionStats_IgnoresUnknownTypes(t *testing.T) {
 	assert.Empty(t, pts)
 }
 
+func TestExtractProductionStats_IgnoresUnknownConsumptionType(t *testing.T) {
+	t.Parallel()
+
+	prod := &envoy.ProductionResponse{
+		Consumption: []envoy.Measurement{
+			{MeasurementType: "unknown-consumption", Lines: []envoy.Line{{WNow: 50}}},
+		},
+	}
+	pts := extractProductionStats(prod, "test", time.Now())
+	assert.Empty(t, pts)
+}
+
 func TestExtractInverterStats(t *testing.T) {
+	t.Parallel()
+
 	inverters := &[]envoy.Inverter{
 		{SerialNumber: "ABC", LastReportWatts: 250},
 		{SerialNumber: "DEF", LastReportWatts: 300},
@@ -146,6 +213,8 @@ func TestExtractInverterStats(t *testing.T) {
 }
 
 func TestExtractBatteryStats(t *testing.T) {
+	t.Parallel()
+
 	batteries := &[]envoy.Battery{
 		{SerialNum: "BAT1", PercentFull: 80, Temperature: 25},
 	}
@@ -159,6 +228,8 @@ func TestExtractBatteryStats(t *testing.T) {
 }
 
 func TestScrape_AllSources(t *testing.T) {
+	t.Parallel()
+
 	client := &MockEnvoyClient{
 		ProductionFunc: func() (*envoy.ProductionResponse, error) {
 			return &envoy.ProductionResponse{
@@ -182,19 +253,21 @@ func TestScrape_AllSources(t *testing.T) {
 }
 
 func TestScrape_ProductionError(t *testing.T) {
+	t.Parallel()
+
 	client := &MockEnvoyClient{
 		ProductionFunc: func() (*envoy.ProductionResponse, error) {
 			return nil, errors.New("network error")
 		},
 	}
-	writer := &MockPointWriter{}
-
-	result := scrape(context.Background(), client, writer, "test")
+	result := scrape(context.Background(), client, &MockPointWriter{}, "test")
 	assert.Equal(t, 0, result.points)
 	assert.True(t, result.hasErr)
 }
 
 func TestScrape_WriteError(t *testing.T) {
+	t.Parallel()
+
 	client := &MockEnvoyClient{
 		ProductionFunc: func() (*envoy.ProductionResponse, error) {
 			return &envoy.ProductionResponse{
@@ -216,7 +289,9 @@ func TestScrape_WriteError(t *testing.T) {
 }
 
 func TestScrape_PartialErrors(t *testing.T) {
-	// Production succeeds, inverters fail — expect production points written.
+	t.Parallel()
+
+	// Production succeeds, inverters and batteries fail — expect only production points.
 	client := &MockEnvoyClient{
 		ProductionFunc: func() (*envoy.ProductionResponse, error) {
 			return &envoy.ProductionResponse{
@@ -240,16 +315,19 @@ func TestScrape_PartialErrors(t *testing.T) {
 }
 
 func TestConnectWithBackoff_ImmediateSuccess(t *testing.T) {
+	t.Parallel()
+
 	client := &MockEnvoyClient{}
 	factory := func(_ *Config) (EnvoyClient, error) { return client, nil }
 
-	ctx := context.Background()
-	e, err := connectWithBackoff(ctx, &Config{}, factory, 10*time.Millisecond, 1*time.Second)
+	e, err := connectWithBackoff(context.Background(), &Config{}, factory, 10*time.Millisecond, 1*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, client, e)
 }
 
 func TestConnectWithBackoff_RetriesThenSucceeds(t *testing.T) {
+	t.Parallel()
+
 	attempts := 0
 	client := &MockEnvoyClient{}
 	factory := func(_ *Config) (EnvoyClient, error) {
@@ -260,14 +338,40 @@ func TestConnectWithBackoff_RetriesThenSucceeds(t *testing.T) {
 		return client, nil
 	}
 
-	ctx := context.Background()
-	e, err := connectWithBackoff(ctx, &Config{}, factory, 5*time.Millisecond, 1*time.Second)
+	e, err := connectWithBackoff(context.Background(), &Config{}, factory, 5*time.Millisecond, 1*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, client, e)
 	assert.Equal(t, 3, attempts)
 }
 
+// TestConnectWithBackoff_BackoffCap verifies that the delay is capped at maxDelay.
+// With base=2ms and maxDelay=3ms, the progression is: wait 2ms (backoff→3ms), wait 3ms,
+// wait 3ms... rather than the uncapped 2ms, 4ms, 8ms, 16ms.
+func TestConnectWithBackoff_BackoffCap(t *testing.T) {
+	t.Parallel()
+
+	attempts := 0
+	client := &MockEnvoyClient{}
+	factory := func(_ *Config) (EnvoyClient, error) {
+		attempts++
+		if attempts < 5 {
+			return nil, errors.New("not ready")
+		}
+		return client, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	e, err := connectWithBackoff(ctx, &Config{}, factory, 2*time.Millisecond, 3*time.Millisecond)
+	require.NoError(t, err)
+	assert.Equal(t, client, e)
+	assert.Equal(t, 5, attempts)
+}
+
 func TestConnectWithBackoff_CancelledContext(t *testing.T) {
+	t.Parallel()
+
 	factory := func(_ *Config) (EnvoyClient, error) {
 		return nil, errors.New("always fails")
 	}
@@ -280,6 +384,8 @@ func TestConnectWithBackoff_CancelledContext(t *testing.T) {
 }
 
 func TestScrapeLoop_RunsAndWritesPoints(t *testing.T) {
+	t.Parallel()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
@@ -295,14 +401,14 @@ func TestScrapeLoop_RunsAndWritesPoints(t *testing.T) {
 	writer := &MockPointWriter{}
 	factory := func(_ *Config) (EnvoyClient, error) { return client, nil }
 
-	cfg := &Config{Interval: 1, RetryInterval: 1}
-
-	scrapeLoop(ctx, cfg, writer, factory, nil)
+	scrapeLoop(ctx, cfg1(), writer, factory, nil)
 
 	assert.NotEmpty(t, writer.Written, "scrape loop should have written points")
 }
 
 func TestScrapeLoop_ConnectionRetry(t *testing.T) {
+	t.Parallel()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -316,12 +422,13 @@ func TestScrapeLoop_ConnectionRetry(t *testing.T) {
 		return client, nil
 	}
 
-	cfg := &Config{Interval: 1, RetryInterval: 1}
-
-	scrapeLoop(ctx, cfg, &MockPointWriter{}, factory, nil)
+	scrapeLoop(ctx, cfg1(), &MockPointWriter{}, factory, nil)
 
 	assert.GreaterOrEqual(t, attempts, 2)
 }
+
+// cfg1 returns a minimal Config suitable for scrapeLoop tests.
+func cfg1() *Config { return &Config{Interval: 1, RetryInterval: 1} }
 
 // helpers
 
@@ -333,8 +440,8 @@ func tagMap(pt *influxdb2write.Point) map[string]string {
 	return m
 }
 
-func fieldMap(pt *influxdb2write.Point) map[string]interface{} {
-	m := make(map[string]interface{})
+func fieldMap(pt *influxdb2write.Point) map[string]any {
+	m := make(map[string]any)
 	for _, f := range pt.FieldList() {
 		m[f.Key] = f.Value
 	}

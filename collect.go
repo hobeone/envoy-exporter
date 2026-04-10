@@ -14,11 +14,11 @@ import (
 
 const (
 	// Measurement names written to InfluxDB.
-	MeasurementProduction      = "production"
+	MeasurementProduction       = "production"
 	MeasurementTotalConsumption = "total-consumption"
-	MeasurementNetConsumption  = "net-consumption"
-	MeasurementInverter        = "inverter"
-	MeasurementBattery         = "battery"
+	MeasurementNetConsumption   = "net-consumption"
+	MeasurementInverter         = "inverter"
+	MeasurementBattery          = "battery"
 
 	// Tag keys.
 	TagSource          = "source"
@@ -60,8 +60,7 @@ type scrapeResult struct {
 
 // lineToPoint builds an InfluxDB point for a single phase line.
 // namePrefix forms the measurement name ("<namePrefix>-line<idx>").
-// typeTag is written as the measurement-type tag value, which may differ from namePrefix
-// (e.g. namePrefix="consumption", typeTag="total-consumption").
+// typeTag is written as the measurement-type tag value.
 func lineToPoint(namePrefix, typeTag string, line envoy.Line, idx int, sourceTag string, t time.Time) *influxdb2write.Point {
 	return influxdb2.NewPointWithMeasurement(fmt.Sprintf("%s-line%d", namePrefix, idx)).
 		AddTag(TagSource, sourceTag).
@@ -126,6 +125,27 @@ func extractBatteryStats(batteries *[]envoy.Battery, sourceTag string, t time.Ti
 	return ps
 }
 
+// logPoint emits a Debug-level log entry for a single InfluxDB point,
+// grouping tags and fields for clean structured output.
+func logPoint(pt *influxdb2write.Point) {
+	tagArgs := make([]any, 0, len(pt.TagList())*2)
+	for _, tag := range pt.TagList() {
+		tagArgs = append(tagArgs, tag.Key, tag.Value)
+	}
+
+	fieldArgs := make([]any, 0, len(pt.FieldList())*2)
+	for _, field := range pt.FieldList() {
+		fieldArgs = append(fieldArgs, field.Key, field.Value)
+	}
+
+	slog.Debug("write point",
+		"measurement", pt.Name(),
+		"time", pt.Time(),
+		slog.Group("tags", tagArgs...),
+		slog.Group("fields", fieldArgs...),
+	)
+}
+
 // scrape fetches data from all Envoy endpoints and writes points to InfluxDB.
 // Errors from individual endpoints are logged but do not abort the scrape.
 func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag string) scrapeResult {
@@ -187,6 +207,11 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 	if len(points) > 0 {
 		writeCtx, writeCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer writeCancel()
+		if slog.Default().Enabled(writeCtx, slog.LevelDebug) {
+			for _, pt := range points {
+				logPoint(pt)
+			}
+		}
 		t = time.Now()
 		if err := writeAPI.WritePoint(writeCtx, points...); err != nil {
 			slog.Error("InfluxDB write failed",
