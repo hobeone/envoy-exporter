@@ -6,11 +6,6 @@ services:
     restart: unless-stopped
     volumes:
       - ./envoy.yaml:/etc/envoy-exporter/envoy.yaml
-    ports:
-      - "6666:6666"
-    # Example environment variables if needed
-    # environment:
-    #   - TZ=UTC
     networks:
       - nginx_proxy_network
 
