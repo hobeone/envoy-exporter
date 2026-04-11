@@ -6,13 +6,13 @@ toolchain go1.25.1
 
 require (
 	github.com/golang-jwt/jwt/v4 v4.5.2
-	github.com/hobeone/enphase-gateway v0.0.0
+	github.com/hobeone/enphase-gateway v1.0.0
 	github.com/influxdata/influxdb-client-go/v2 v2.14.0
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-replace github.com/hobeone/enphase-gateway => ./gateway
+// replace github.com/hobeone/enphase-gateway => ../enphase-gateway
 
 require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect

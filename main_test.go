@@ -59,16 +59,9 @@ func TestAuthenticateWithEnphase(t *testing.T) {
 	}))
 	defer server.Close()
 
-	origEnlighten := gateway.EnlightenBaseURL
-	origEntrez := gateway.EntrezBaseURL
-	gateway.EnlightenBaseURL = server.URL
-	gateway.EntrezBaseURL = server.URL
-	defer func() {
-		gateway.EnlightenBaseURL = origEnlighten
-		gateway.EntrezBaseURL = origEntrez
-	}()
-
-	token, err := AuthenticateWithEnphase("user@example.com", "pass", "12345")
+	token, err := AuthenticateWithEnphase("user@example.com", "pass", "12345",
+		gateway.WithEnlightenURL(server.URL),
+		gateway.WithEntrezURL(server.URL))
 	require.NoError(t, err)
 	assert.Equal(t, "mock-jwt-token", token)
 }
@@ -81,16 +74,9 @@ func TestAuthenticateWithEnphase_LoginFails(t *testing.T) {
 	}))
 	defer server.Close()
 
-	origEnlighten := gateway.EnlightenBaseURL
-	origEntrez := gateway.EntrezBaseURL
-	gateway.EnlightenBaseURL = server.URL
-	gateway.EntrezBaseURL = server.URL
-	defer func() {
-		gateway.EnlightenBaseURL = origEnlighten
-		gateway.EntrezBaseURL = origEntrez
-	}()
-
-	_, err := AuthenticateWithEnphase("bad", "creds", "12345")
+	_, err := AuthenticateWithEnphase("bad", "creds", "12345",
+		gateway.WithEnlightenURL(server.URL),
+		gateway.WithEntrezURL(server.URL))
 	assert.Error(t, err)
 }
 
@@ -107,16 +93,9 @@ func TestAuthenticateWithEnphase_JSONResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	origEnlighten := gateway.EnlightenBaseURL
-	origEntrez := gateway.EntrezBaseURL
-	gateway.EnlightenBaseURL = server.URL
-	gateway.EntrezBaseURL = server.URL
-	defer func() {
-		gateway.EnlightenBaseURL = origEnlighten
-		gateway.EntrezBaseURL = origEntrez
-	}()
-
-	token, err := AuthenticateWithEnphase("user", "pass", "serial")
+	token, err := AuthenticateWithEnphase("user", "pass", "serial",
+		gateway.WithEnlightenURL(server.URL),
+		gateway.WithEntrezURL(server.URL))
 	require.NoError(t, err)
 	assert.Equal(t, "jwt-from-json", token)
 }
@@ -143,7 +122,7 @@ func TestFetchWithRetry_ImmediateSuccess(t *testing.T) {
 	t.Parallel()
 
 	cfg := &Config{Username: "u", Password: "p", SerialNumber: "s"}
-	fetch := func(_, _, _ string) (string, error) { return "token", nil }
+	fetch := func(_, _, _ string, _ ...gateway.AuthOption) (string, error) { return "token", nil }
 
 	token, err := fetchWithRetry(context.Background(), cfg, time.Millisecond, fetch)
 	require.NoError(t, err)
@@ -155,7 +134,7 @@ func TestFetchWithRetry_RetriesOnError(t *testing.T) {
 
 	cfg := &Config{Username: "u", Password: "p", SerialNumber: "s"}
 	calls := 0
-	fetch := func(_, _, _ string) (string, error) {
+	fetch := func(_, _, _ string, _ ...gateway.AuthOption) (string, error) {
 		calls++
 		if calls < 3 {
 			return "", errors.New("transient")
@@ -173,7 +152,7 @@ func TestFetchWithRetry_CancelledContext(t *testing.T) {
 	t.Parallel()
 
 	cfg := &Config{Username: "u", Password: "p", SerialNumber: "s"}
-	fetch := func(_, _, _ string) (string, error) { return "", errors.New("always fails") }
+	fetch := func(_, _, _ string, _ ...gateway.AuthOption) (string, error) { return "", errors.New("always fails") }
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -199,7 +178,7 @@ func TestJWTRefresher_RefreshesExpiredToken(t *testing.T) {
 
 	newJWT := makeTestJWT(time.Now().Add(24 * time.Hour))
 	fetchCalled := make(chan struct{}, 1)
-	mockFetch := func(username, password, serial string) (string, error) {
+	mockFetch := func(username, password, serial string, _ ...gateway.AuthOption) (string, error) {
 		fetchCalled <- struct{}{}
 		return newJWT, nil
 	}
@@ -238,7 +217,7 @@ func TestJWTRefresher_RetriesOnFetchError(t *testing.T) {
 
 	attempts := 0
 	newJWT := makeTestJWT(time.Now().Add(24 * time.Hour))
-	mockFetch := func(username, password, serial string) (string, error) {
+	mockFetch := func(username, password, serial string, _ ...gateway.AuthOption) (string, error) {
 		attempts++
 		if attempts < 2 {
 			return "", fmt.Errorf("transient error")
@@ -275,7 +254,7 @@ func TestJWTRefresher_ContextCancelledDuringDelay(t *testing.T) {
 	}
 
 	fetchCalled := false
-	mockFetch := func(_, _, _ string) (string, error) {
+	mockFetch := func(_, _, _ string, _ ...gateway.AuthOption) (string, error) {
 		fetchCalled = true
 		return "", errors.New("should not be called")
 	}
@@ -311,7 +290,7 @@ func TestJWTRefresher_PersistsCalled(t *testing.T) {
 	}
 
 	newJWT := makeTestJWT(time.Now().Add(24 * time.Hour))
-	mockFetch := func(_, _, _ string) (string, error) { return newJWT, nil }
+	mockFetch := func(_, _, _ string, _ ...gateway.AuthOption) (string, error) { return newJWT, nil }
 
 	var persistedToken string
 	mockPersist := func(token string) error {

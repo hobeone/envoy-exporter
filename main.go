@@ -78,8 +78,8 @@ func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
 // AuthenticateWithEnphase fetches a JWT from Enphase cloud using username/password
 // credentials. Delegates to gateway.FetchJWT which implements the two-step
 // Enlighten login + Entrez token exchange documented in the IQ Gateway API spec.
-func AuthenticateWithEnphase(username, password, serial string) (string, error) {
-	tr, err := gateway.FetchJWT(context.Background(), username, password, serial)
+func AuthenticateWithEnphase(username, password, serial string, opts ...gateway.AuthOption) (string, error) {
+	tr, err := gateway.FetchJWT(context.Background(), username, password, serial, opts...)
 	if err != nil {
 		return "", err
 	}
@@ -166,7 +166,7 @@ func persistJWTToConfig(path, token string) error {
 }
 
 // tokenFetcher is a function that obtains a fresh JWT from Enphase.
-type tokenFetcher func(username, password, serial string) (string, error)
+type tokenFetcher func(username, password, serial string, opts ...gateway.AuthOption) (string, error)
 
 // fetchWithRetry calls fetch repeatedly until it succeeds or ctx is cancelled.
 // It waits retryWait between attempts.
