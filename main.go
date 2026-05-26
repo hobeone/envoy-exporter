@@ -21,6 +21,7 @@ import (
 	yaml "gopkg.in/yaml.v3"
 )
 
+
 func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
 	// Create client with skip TLS verification matching config
 	client := gateway.NewClient(cfg.Address, cfg.GetJWT(), gateway.WithInsecureSkipVerify(cfg.InsecureSkipVerify))

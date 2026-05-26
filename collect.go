@@ -27,6 +27,7 @@ const (
 	MeasurementTotalConsumption = "total-consumption"
 	MeasurementNetConsumption   = "net-consumption"
 	MeasurementInverter         = "inverter"
+	MeasurementBattery          = "battery"
 
 	// Tag keys.
 	TagSource          = "source"
@@ -47,6 +48,8 @@ type EnvoyClient interface {
 	LiveData(ctx context.Context) (gateway.LiveData, error)
 	Inverters(ctx context.Context) ([]gateway.InverterReading, error)
 	TypedMeterReadings(ctx context.Context) ([]gateway.TypedCTReading, error)
+	BatteryInventory(ctx context.Context) ([]gateway.BatteryStatus, error)
+	EnableHighFrequencyMode(ctx context.Context) error
 }
 
 // PointWriter abstracts the InfluxDB blocking write API for testability.
@@ -139,6 +142,28 @@ func extractInverterPoints(inverters []gateway.InverterReading, sourceTag string
 	return ps
 }
 
+// extractBatteryPoints builds one InfluxDB point per Encharge battery unit.
+// Each point carries operational telemetry: state of charge, temperatures,
+// capacity, grid mode, and communication state.
+func extractBatteryPoints(batteries []gateway.BatteryStatus, sourceTag string, t time.Time) []*influxdb2write.Point {
+	ps := make([]*influxdb2write.Point, len(batteries))
+	for i, b := range batteries {
+		ps[i] = influxdb2.NewPointWithMeasurement(fmt.Sprintf("battery-%s", b.SerialNum)).
+			AddTag(TagSource, sourceTag).
+			AddTag(TagMeasurementType, MeasurementBattery).
+			AddTag(TagSerial, b.SerialNum).
+			AddTag("phase", b.Phase).
+			AddField("percent_full", b.PercentFull).
+			AddField("temperature_c", b.Temperature).
+			AddField("max_cell_temp_c", b.MaxCellTemp).
+			AddField("capacity_wh", b.CapacityWh).
+			AddField("grid_mode", b.GridMode).
+			AddField("communicating", b.Communicating).
+			SetTime(t)
+	}
+	return ps
+}
+
 // logPoint emits a Debug-level log entry for a single InfluxDB point,
 // grouping tags and fields for clean structured output.
 func logPoint(pt *influxdb2write.Point) {
@@ -179,7 +204,7 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 		hasErr = true
 	} else {
 		pts := extractLiveDataPoints(live, sourceTag, scrapeTime)
-		slog.Debug("LiveData fetch", "duration", dur, "points", len(pts))
+		slog.Debug("LiveData fetch", "duration", dur, "points", len(pts), "sc_stream", live.Connection.SCStream)
 		points = append(points, pts...)
 	}
 
@@ -209,6 +234,23 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 		slog.Debug("Inverters fetch", "duration", dur, "inverters", len(inverters))
 		if len(inverters) > 0 {
 			points = append(points, extractInverterPoints(inverters, sourceTag, scrapeTime)...)
+		}
+	}
+
+	t = time.Now()
+	batteries, err := e.BatteryInventory(ctx)
+	dur = time.Since(t)
+	if err != nil {
+		if gateway.IsNotFound(err) {
+			slog.Debug("No battery inventory endpoint; skipping batteries")
+		} else {
+			slog.Error("BatteryInventory fetch failed", "error", err, "duration", dur)
+			hasErr = true
+		}
+	} else {
+		slog.Debug("BatteryInventory fetch", "duration", dur, "batteries", len(batteries))
+		if len(batteries) > 0 {
+			points = append(points, extractBatteryPoints(batteries, sourceTag, scrapeTime)...)
 		}
 	}
 
@@ -278,6 +320,12 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, factory 
 	if err != nil {
 		return // context cancelled before we connected
 	}
+	if err := e.EnableHighFrequencyMode(ctx); err != nil {
+		slog.Warn("Failed to enable high-frequency mode; LiveData will refresh at default interval (~5s)",
+			"endpoint", "/ivp/livedata/stream", "error", err)
+	} else {
+		slog.Info("High-frequency mode enabled", "endpoint", "/ivp/livedata/stream")
+	}
 
 	ticker := time.NewTicker(time.Duration(cfg.Interval) * time.Second)
 	defer ticker.Stop()
@@ -314,6 +362,12 @@ func scrapeLoop(ctx context.Context, cfg *Config, writeAPI PointWriter, factory 
 				return
 			}
 			e = newClient
+			if err := e.EnableHighFrequencyMode(ctx); err != nil {
+				slog.Warn("Failed to re-enable high-frequency mode after reconnect",
+					"endpoint", "/ivp/livedata/stream", "error", err)
+			} else {
+				slog.Info("High-frequency mode re-enabled after reconnect", "endpoint", "/ivp/livedata/stream")
+			}
 		case t := <-ticker.C:
 			doScrapeAt(t)
 		}

@@ -14,9 +14,11 @@ import (
 
 // MockEnvoyClient implements EnvoyClient using configurable func fields.
 type MockEnvoyClient struct {
-	LiveDataFunc           func(ctx context.Context) (gateway.LiveData, error)
-	InvertersFunc          func(ctx context.Context) ([]gateway.InverterReading, error)
-	TypedMeterReadingsFunc func(ctx context.Context) ([]gateway.TypedCTReading, error)
+	LiveDataFunc                func(ctx context.Context) (gateway.LiveData, error)
+	InvertersFunc               func(ctx context.Context) ([]gateway.InverterReading, error)
+	TypedMeterReadingsFunc      func(ctx context.Context) ([]gateway.TypedCTReading, error)
+	BatteryInventoryFunc        func(ctx context.Context) ([]gateway.BatteryStatus, error)
+	EnableHighFrequencyModeFunc func(ctx context.Context) error
 }
 
 func (m *MockEnvoyClient) LiveData(ctx context.Context) (gateway.LiveData, error) {
@@ -38,6 +40,20 @@ func (m *MockEnvoyClient) TypedMeterReadings(ctx context.Context) ([]gateway.Typ
 		return m.TypedMeterReadingsFunc(ctx)
 	}
 	return nil, nil
+}
+
+func (m *MockEnvoyClient) BatteryInventory(ctx context.Context) ([]gateway.BatteryStatus, error) {
+	if m.BatteryInventoryFunc != nil {
+		return m.BatteryInventoryFunc(ctx)
+	}
+	return []gateway.BatteryStatus{}, nil
+}
+
+func (m *MockEnvoyClient) EnableHighFrequencyMode(ctx context.Context) error {
+	if m.EnableHighFrequencyModeFunc != nil {
+		return m.EnableHighFrequencyModeFunc(ctx)
+	}
+	return nil
 }
 
 // MockPointWriter captures written points for assertion.
@@ -167,6 +183,50 @@ func TestExtractInverterPoints(t *testing.T) {
 	assert.Equal(t, 250.0, fieldMap(pts[0])["P"])
 }
 
+func TestExtractBatteryPoints(t *testing.T) {
+	t.Parallel()
+
+	batteries := []gateway.BatteryStatus{
+		{
+			SerialNum:   "BAT001",
+			PercentFull: 75,
+			Temperature: 28,
+			MaxCellTemp: 31,
+			CapacityWh:  3500,
+			Phase:       "ph-a",
+			GridMode:    "multimode-ongrid",
+			Communicating: true,
+		},
+		{
+			SerialNum:   "BAT002",
+			PercentFull: 50,
+			Temperature: 26,
+			MaxCellTemp: 29,
+			CapacityWh:  3500,
+			Phase:       "ph-b",
+			GridMode:    "multimode-ongrid",
+			Communicating: true,
+		},
+	}
+	pts := extractBatteryPoints(batteries, "home", time.Now())
+	require.Len(t, pts, 2)
+
+	assert.Equal(t, "battery-BAT001", pts[0].Name())
+	assert.Equal(t, "battery-BAT002", pts[1].Name())
+	assert.Equal(t, MeasurementBattery, tagMap(pts[0])["measurement-type"])
+	assert.Equal(t, "BAT001", tagMap(pts[0])["serial"])
+	assert.Equal(t, "ph-a", tagMap(pts[0])["phase"])
+	assert.Equal(t, "home", tagMap(pts[0])["source"])
+
+	fields := fieldMap(pts[0])
+	assert.Equal(t, int64(75), fields["percent_full"])
+	assert.Equal(t, int64(28), fields["temperature_c"])
+	assert.Equal(t, int64(31), fields["max_cell_temp_c"])
+	assert.Equal(t, int64(3500), fields["capacity_wh"])
+	assert.Equal(t, "multimode-ongrid", fields["grid_mode"])
+	assert.Equal(t, true, fields["communicating"])
+}
+
 func TestScrape_AllSources(t *testing.T) {
 	t.Parallel()
 
@@ -183,12 +243,53 @@ func TestScrape_AllSources(t *testing.T) {
 				MeasurementType: MeasurementProduction,
 			}}, nil
 		},
+		BatteryInventoryFunc: func(_ context.Context) ([]gateway.BatteryStatus, error) {
+			return []gateway.BatteryStatus{{SerialNum: "BAT1", PercentFull: 80}}, nil
+		},
 	}
 	writer := &MockPointWriter{}
 
 	result := scrape(context.Background(), client, writer, "test")
-	assert.Equal(t, 3, result.points) // 1 energy-snapshot + 1 inverter + 1 CT channel
+	assert.Equal(t, 4, result.points) // 1 energy-snapshot + 1 inverter + 1 CT channel + 1 battery
 	assert.False(t, result.hasErr)
+}
+
+func TestScrape_BatteryError(t *testing.T) {
+	t.Parallel()
+
+	// Battery fetch fails — other points still written, error flagged.
+	client := &MockEnvoyClient{
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return makeLiveData(1000000, 0, 0, 1000000), nil
+		},
+		BatteryInventoryFunc: func(_ context.Context) ([]gateway.BatteryStatus, error) {
+			return nil, errors.New("battery error")
+		},
+	}
+	writer := &MockPointWriter{}
+
+	result := scrape(context.Background(), client, writer, "test")
+	assert.Equal(t, 1, result.points) // energy-snapshot still written
+	assert.True(t, result.hasErr)
+}
+
+func TestScrape_BatteryNotFound(t *testing.T) {
+	t.Parallel()
+
+	// Battery endpoint returns 404 — treated as non-error (no Encharge units).
+	client := &MockEnvoyClient{
+		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
+			return makeLiveData(1000000, 0, 0, 1000000), nil
+		},
+		BatteryInventoryFunc: func(_ context.Context) ([]gateway.BatteryStatus, error) {
+			return nil, &gateway.Error{StatusCode: 404, Endpoint: "/ivp/ensemble/inventory"}
+		},
+	}
+	writer := &MockPointWriter{}
+
+	result := scrape(context.Background(), client, writer, "test")
+	assert.Equal(t, 1, result.points)
+	assert.False(t, result.hasErr, "404 from battery endpoint should not be treated as an error")
 }
 
 func TestScrape_LiveDataError(t *testing.T) {
