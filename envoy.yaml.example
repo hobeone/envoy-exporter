@@ -1,11 +1,71 @@
 ---
-username: YOUR_USERNAME
-password: YOUR_PASSWORD
-address: LOCAL_ENVOY_URL
-serial: YOUR_ENVOY_SERIAL_NUMBER
-source: power-meter
-jwt: YOUR_JWT_TOKEN (OPTIONAL)
-influxdb: YOUR INFLUXDB HOST:PORT
-influxdb_token: 
-influxdb_org: my_org
-influxdb_bucket: my_bucket
+# ==============================================================================
+# Envoy Exporter Configuration Template
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Gateway Connectivity & Serial (Required)
+# ------------------------------------------------------------------------------
+# Local URL or IP address of your Enphase IQ Gateway.
+address: "https://192.168.1.100"
+
+# Gateway device serial number (used in Enlighten auth endpoints).
+serial: "YOUR_ENVOY_SERIAL_NUMBER"
+
+# ------------------------------------------------------------------------------
+# Authentication (Provide username+password, jwt, or both)
+# ------------------------------------------------------------------------------
+# Enphase Enlighten account credentials. Needed for automatic JWT retrieval
+# and background JWT token refresh cycles.
+username: "user@example.com"
+password: "YOUR_ENLIGHTEN_PASSWORD"
+
+# Pre-obtained static JWT token. If username and password are provided,
+# the token will be fetched automatically and refreshed before it expires.
+# jwt: "YOUR_PRE_OBTAINED_JWT_TOKEN"
+
+# ------------------------------------------------------------------------------
+# InfluxDB v2 Destination (Required)
+# ------------------------------------------------------------------------------
+influxdb: "http://localhost:8086"
+influxdb_token: "YOUR_INFLUXDB_WRITE_TOKEN"
+influxdb_org: "my_org"
+influxdb_bucket: "my_bucket"
+
+# ------------------------------------------------------------------------------
+# Exporter Customization & Operational Tuning (Optional)
+# ------------------------------------------------------------------------------
+# Custom tag value for 'source' attached to all generated InfluxDB points.
+source: "power-meter"
+
+# Scrape interval in seconds.
+# Default: 30
+interval: 30
+
+# Base interval in seconds between connection retries on startup/reconnects.
+# Connection retries utilize exponential backoff (starting at retry_interval
+# and doubling on each failure up to a cap of 5 minutes).
+# Default: 5
+retry_interval: 5
+
+# How many minutes before expiration the background routine fetches a fresh JWT.
+# Default: 60
+jwt_refresh_lead_time: 60
+
+# If true, the exporter will write refreshed JWT tokens back into this YAML file.
+# Default: false
+persist_jwt: false
+
+# Logging verbosity: debug, info, warn, or error.
+# Default: "info"
+log_level: "info"
+
+# Network port for the built-in expvar metrics and health HTTP server.
+# The server binds to 0.0.0.0:<expvar_port> to be accessible within Docker.
+# Default: 6666
+expvar_port: 6666
+
+# Skip TLS certificate validation when making HTTPS requests to the Envoy gateway.
+# Useful if the gateway utilizes self-signed SSL/TLS certificates.
+# Default: false
+tls_insecure_skip_verify: false
