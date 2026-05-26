@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -10,6 +11,14 @@ import (
 	gateway "github.com/hobeone/enphase-gateway"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	influxdb2write "github.com/influxdata/influxdb-client-go/v2/api/write"
+)
+
+var (
+	metricScrapeTotal          = expvar.NewInt("scrape_total")
+	metricScrapeErrors         = expvar.NewInt("scrape_errors")
+	metricPointsWrittenTotal   = expvar.NewInt("points_written_total")
+	metricLastScrapeDurationMS = expvar.NewInt("last_scrape_duration_ms")
+	metricLastScrapeTime       = expvar.NewInt("last_scrape_time")
 )
 
 const (
@@ -33,19 +42,11 @@ const (
 	FieldVrms = "V_rms"
 )
 
-// TypedCTReading pairs a raw CT reading with the measurement type
-// (production, net-consumption, total-consumption) inferred from the
-// gateway's meter configuration.
-type TypedCTReading struct {
-	gateway.CTReading
-	MeasurementType string
-}
-
 // EnvoyClient defines the methods for interacting with the Envoy gateway.
 type EnvoyClient interface {
 	LiveData(ctx context.Context) (gateway.LiveData, error)
 	Inverters(ctx context.Context) ([]gateway.InverterReading, error)
-	TypedMeterReadings(ctx context.Context) ([]TypedCTReading, error)
+	TypedMeterReadings(ctx context.Context) ([]gateway.TypedCTReading, error)
 }
 
 // PointWriter abstracts the InfluxDB blocking write API for testability.
@@ -103,7 +104,7 @@ func ctChannelToPoint(namePrefix, typeTag string, ch gateway.CTChannel, idx int,
 //	"production"        → production-line<N>
 //	"total-consumption" → consumption-line<N>
 //	"net-consumption"   → net-line<N>
-func extractCTPoints(readings []TypedCTReading, sourceTag string, t time.Time) []*influxdb2write.Point {
+func extractCTPoints(readings []gateway.TypedCTReading, sourceTag string, t time.Time) []*influxdb2write.Point {
 	var ps []*influxdb2write.Point
 	for _, r := range readings {
 		var namePrefix string
@@ -163,6 +164,7 @@ func logPoint(pt *influxdb2write.Point) {
 // Errors from individual endpoints are logged but do not abort the scrape.
 // A 404 from the CT meter endpoint is treated as a non-error (no CTs installed).
 func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag string) scrapeResult {
+	metricScrapeTotal.Add(1)
 	var points []*influxdb2write.Point
 	var hasErr bool
 
@@ -230,6 +232,15 @@ func scrape(ctx context.Context, e EnvoyClient, writeAPI PointWriter, sourceTag 
 			slog.Debug("InfluxDB write", "duration", time.Since(t), "points", len(points))
 		}
 	}
+
+	scrapeDur := time.Since(scrapeTime)
+	metricLastScrapeDurationMS.Set(scrapeDur.Milliseconds())
+	if hasErr {
+		metricScrapeErrors.Add(1)
+	} else {
+		metricLastScrapeTime.Set(scrapeTime.Unix())
+	}
+	metricPointsWrittenTotal.Add(int64(len(points)))
 
 	return scrapeResult{points: len(points), hasErr: hasErr}
 }

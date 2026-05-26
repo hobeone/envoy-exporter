@@ -3,12 +3,15 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync"
 
 	yaml "gopkg.in/yaml.v3"
 )
 
 // Config holds all configuration for the exporter.
 type Config struct {
+	mu *sync.RWMutex
+
 	// Envoy gateway
 	Address      string `yaml:"address"`
 	SerialNumber string `yaml:"serial"`
@@ -31,6 +34,28 @@ type Config struct {
 	JWTRefreshLeadTime int    `yaml:"jwt_refresh_lead_time"` // minutes before expiry to refresh; default 60
 	PersistJWT         bool   `yaml:"persist_jwt"`           // write refreshed JWT back to the config file
 	LogLevel           string `yaml:"log_level"`             // debug, info, warn, error; default info
+	ExpvarPort         int    `yaml:"expvar_port"`           // port for expvar HTTP server; default 6666
+	InsecureSkipVerify bool   `yaml:"tls_insecure_skip_verify"` // skip gateway TLS verification; default false
+}
+
+// GetJWT returns the JWT in a thread-safe manner.
+func (c *Config) GetJWT() string {
+	if c.mu == nil {
+		return c.JWT
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.JWT
+}
+
+// SetJWT updates the JWT in a thread-safe manner.
+func (c *Config) SetJWT(jwt string) {
+	if c.mu == nil {
+		c.mu = &sync.RWMutex{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.JWT = jwt
 }
 
 // Validate returns an error if the configuration is missing required fields.
@@ -66,12 +91,14 @@ func LoadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open config file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	cfg := Config{
+		mu:            &sync.RWMutex{},
 		Interval:      30,
 		RetryInterval: 5,
 		LogLevel:      "info",
+		ExpvarPort:    6666,
 	}
 
 	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil {

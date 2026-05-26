@@ -23,7 +23,7 @@ interval: 10
 `)
 	f, err := os.CreateTemp("", "config-*.yaml")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 
 	_, err = f.Write(content)
 	require.NoError(t, err)
@@ -50,7 +50,7 @@ influxdb_bucket: bucket
 `)
 	f, err := os.CreateTemp("", "config-*.yaml")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 
 	_, err = f.Write(content)
 	require.NoError(t, err)

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func TestAuthenticateWithEnphase(t *testing.T) {
 			}
 			if r.FormValue("user[email]") == "user@example.com" && r.FormValue("user[password]") == "pass" {
 				w.Header().Set("Content-Type", "application/json")
-				fmt.Fprint(w, `{"session_id":"test-session"}`)
+				_, _ = fmt.Fprint(w, `{"session_id":"test-session"}`)
 				return
 			}
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -52,7 +53,7 @@ func TestAuthenticateWithEnphase(t *testing.T) {
 				return
 			}
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "mock-jwt-token")
+			_, _ = fmt.Fprint(w, "mock-jwt-token")
 		default:
 			http.NotFound(w, r)
 		}
@@ -85,10 +86,10 @@ func TestAuthenticateWithEnphase_JSONResponse(t *testing.T) {
 		switch r.URL.Path {
 		case "/login/login.json":
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"session_id":"test-session"}`)
+			_, _ = fmt.Fprint(w, `{"session_id":"test-session"}`)
 		case "/tokens":
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"generation_time":1000000,"token":"jwt-from-json","expires_at":9999999}`)
+			_, _ = fmt.Fprint(w, `{"generation_time":1000000,"token":"jwt-from-json","expires_at":9999999}`)
 		}
 	}))
 	defer server.Close()
@@ -321,7 +322,7 @@ username: user@example.com
 `)
 	f, err := os.CreateTemp("", "config-*.yaml")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 	_, err = f.Write(content)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
@@ -353,7 +354,7 @@ influxdb_bucket: bucket
 `)
 	f, err := os.CreateTemp("", "config-*.yaml")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 	_, err = f.Write(content)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
@@ -429,7 +430,7 @@ func TestRun_ValidationFail(t *testing.T) {
 	content := []byte("address: https://192.168.1.1\nserial: 12345\n")
 	f, err := os.CreateTemp("", "cfg-*.yaml")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 	_, err = f.Write(content)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
@@ -437,4 +438,67 @@ func TestRun_ValidationFail(t *testing.T) {
 	err = run([]string{"-config", f.Name()})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "configuration validation failed")
+}
+
+func TestConfig_JWTConcurrency(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{}
+	var wg sync.WaitGroup
+	for i := range 100 {
+		wg.Add(2)
+		go func(val int) {
+			defer wg.Done()
+			cfg.SetJWT(fmt.Sprintf("token-%d", val))
+		}(i)
+		go func() {
+			defer wg.Done()
+			_ = cfg.GetJWT()
+		}()
+	}
+	wg.Wait()
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	// Reinitialize metrics for clean test state
+	metricLastScrapeTime.Set(0)
+
+	ctx := t.Context()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "/health", nil)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastScrape := metricLastScrapeTime.Value()
+		if lastScrape == 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("degraded: no successful scrape yet\n"))
+			return
+		}
+		if time.Since(time.Unix(lastScrape, 0)) > 3*time.Second {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("degraded: last successful scrape was too long ago\n"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "no successful scrape yet")
+
+	metricLastScrapeTime.Set(time.Now().Unix())
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req)
+	assert.Equal(t, http.StatusOK, w2.Code)
+	assert.Contains(t, w2.Body.String(), "ok")
+
+	metricLastScrapeTime.Set(time.Now().Add(-10 * time.Second).Unix())
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w3.Code)
+	assert.Contains(t, w3.Body.String(), "too long ago")
 }

@@ -2,15 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
+	"expvar"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -19,60 +21,16 @@ import (
 	yaml "gopkg.in/yaml.v3"
 )
 
-// gatewayAdapter wraps a gateway.Client and implements EnvoyClient.
-// It caches the EID→MeasurementType mapping from the meter configuration
-// on the first call to TypedMeterReadings.
-type gatewayAdapter struct {
-	client     *gateway.Client
-	mu         sync.Mutex
-	meterTypes map[int64]string // EID → MeasurementType; nil until first load
-}
-
-func (a *gatewayAdapter) LiveData(ctx context.Context) (gateway.LiveData, error) {
-	return a.client.LiveData(ctx)
-}
-
-func (a *gatewayAdapter) Inverters(ctx context.Context) ([]gateway.InverterReading, error) {
-	return a.client.Inverters(ctx)
-}
-
-func (a *gatewayAdapter) TypedMeterReadings(ctx context.Context) ([]TypedCTReading, error) {
-	a.mu.Lock()
-	meterTypes := a.meterTypes
-	a.mu.Unlock()
-
-	if meterTypes == nil {
-		meters, err := a.client.Meters(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("fetch meter config: %w", err)
-		}
-		meterTypes = make(map[int64]string, len(meters))
-		for _, m := range meters {
-			meterTypes[m.EID] = m.MeasurementType
-		}
-		a.mu.Lock()
-		a.meterTypes = meterTypes
-		a.mu.Unlock()
-	}
-
-	readings, err := a.client.MeterReadings(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]TypedCTReading, len(readings))
-	for i, r := range readings {
-		result[i] = TypedCTReading{
-			CTReading:       r,
-			MeasurementType: meterTypes[r.EID],
-		}
-	}
-	return result, nil
-}
-
 func defaultClientFactory(cfg *Config) (EnvoyClient, error) {
-	client := gateway.NewClient(cfg.Address, cfg.JWT)
-	return &gatewayAdapter{client: client}, nil
+	// Create client with skip TLS verification matching config
+	client := gateway.NewClient(cfg.Address, cfg.GetJWT(), gateway.WithInsecureSkipVerify(cfg.InsecureSkipVerify))
+	// Execute a lightweight validation call to verify gateway reachability at startup
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.LiveData(ctx); err != nil {
+		return nil, fmt.Errorf("failed to verify gateway connectivity: %w", err)
+	}
+	return client, nil
 }
 
 // AuthenticateWithEnphase fetches a JWT from Enphase cloud using username/password
@@ -145,14 +103,14 @@ func persistJWTToConfig(path, token string) error {
 		return fmt.Errorf("create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
+	defer func() { _ = os.Remove(tmpName) }() // no-op after a successful rename
 
 	if err := tmp.Chmod(info.Mode()); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("chmod temp file: %w", err)
 	}
 	if _, err := tmp.Write(out); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -200,10 +158,7 @@ func jwtRefresher(ctx context.Context, cfg *Config, expiry time.Time, reconnectC
 	}
 
 	for {
-		delay := time.Until(expiry.Add(-leadTime))
-		if delay < 0 {
-			delay = 0
-		}
+		delay := max(time.Until(expiry.Add(-leadTime)), 0)
 		select {
 		case <-ctx.Done():
 			return
@@ -215,7 +170,7 @@ func jwtRefresher(ctx context.Context, cfg *Config, expiry time.Time, reconnectC
 			return // ctx cancelled
 		}
 
-		cfg.JWT = newToken
+		cfg.SetJWT(newToken)
 		slog.Info("JWT refreshed successfully")
 
 		if persist != nil {
@@ -324,14 +279,14 @@ func run(args []string) error {
 	}
 
 	// Auto-fetch JWT if credentials are present but no token was supplied.
-	if cfg.JWT == "" && cfg.Username != "" && cfg.Password != "" {
+	if cfg.GetJWT() == "" && cfg.Username != "" && cfg.Password != "" {
 		slog.Info("Fetching JWT from Enphase...")
 		token, err := AuthenticateWithEnphase(cfg.Username, cfg.Password, cfg.SerialNumber)
 		if err != nil {
 			return fmt.Errorf("JWT auto-fetch failed: %w", err)
 		}
 		slog.Info("JWT obtained successfully")
-		cfg.JWT = token
+		cfg.SetJWT(token)
 		if persistFn != nil {
 			if err := persistFn(token); err != nil {
 				slog.Error("Failed to persist initial JWT to config file", "error", err)
@@ -341,8 +296,8 @@ func run(args []string) error {
 
 	// Parse JWT expiry and start proactive refresh if credentials are available.
 	var reconnectCh chan struct{}
-	if cfg.JWT != "" {
-		expiry, err := parseJWTExpiry(cfg.JWT)
+	if cfg.GetJWT() != "" {
+		expiry, err := parseJWTExpiry(cfg.GetJWT())
 		if err != nil {
 			slog.Warn("Could not parse JWT expiry", "error", err)
 		} else {
@@ -368,10 +323,52 @@ func run(args []string) error {
 		"log_level", logLevelFlag,
 		"persist_jwt", persistJWTFlag || cfg.PersistJWT)
 
+	// Start the metrics and health HTTP server
+	startMetricsAndHealthServer(ctx, cfg.ExpvarPort, time.Duration(cfg.Interval)*time.Second)
+
 	influxClient := influxdb2.NewClient(cfg.InfluxDB, cfg.InfluxDBToken)
 	defer influxClient.Close()
 	writeAPI := influxClient.WriteAPIBlocking(cfg.InfluxDBOrg, cfg.InfluxDBBucket)
 
 	scrapeLoop(ctx, cfg, writeAPI, defaultClientFactory, reconnectCh)
 	return nil
+}
+
+func startMetricsAndHealthServer(ctx context.Context, port int, scrapeInterval time.Duration) {
+	mux := http.NewServeMux()
+	mux.Handle("/debug/vars", expvar.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		lastScrape := metricLastScrapeTime.Value()
+		if lastScrape == 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("degraded: no successful scrape yet\n"))
+			return
+		}
+		if time.Since(time.Unix(lastScrape, 0)) > 3*scrapeInterval {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("degraded: last successful scrape was too long ago\n"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf("0.0.0.0:%d", port),
+		Handler: mux,
+	}
+
+	go func() {
+		slog.Info("Starting HTTP server", "addr", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HTTP server failed", "error", err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
 }

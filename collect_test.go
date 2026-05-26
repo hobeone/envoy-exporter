@@ -16,7 +16,7 @@ import (
 type MockEnvoyClient struct {
 	LiveDataFunc           func(ctx context.Context) (gateway.LiveData, error)
 	InvertersFunc          func(ctx context.Context) ([]gateway.InverterReading, error)
-	TypedMeterReadingsFunc func(ctx context.Context) ([]TypedCTReading, error)
+	TypedMeterReadingsFunc func(ctx context.Context) ([]gateway.TypedCTReading, error)
 }
 
 func (m *MockEnvoyClient) LiveData(ctx context.Context) (gateway.LiveData, error) {
@@ -33,7 +33,7 @@ func (m *MockEnvoyClient) Inverters(ctx context.Context) ([]gateway.InverterRead
 	return nil, nil
 }
 
-func (m *MockEnvoyClient) TypedMeterReadings(ctx context.Context) ([]TypedCTReading, error) {
+func (m *MockEnvoyClient) TypedMeterReadings(ctx context.Context) ([]gateway.TypedCTReading, error) {
 	if m.TypedMeterReadingsFunc != nil {
 		return m.TypedMeterReadingsFunc(ctx)
 	}
@@ -99,7 +99,7 @@ func TestExtractLiveDataPoints(t *testing.T) {
 func TestExtractCTPoints(t *testing.T) {
 	t.Parallel()
 
-	readings := []TypedCTReading{
+	readings := []gateway.TypedCTReading{
 		{
 			CTReading: gateway.CTReading{
 				Channels: []gateway.CTChannel{
@@ -141,7 +141,7 @@ func TestExtractCTPoints(t *testing.T) {
 func TestExtractCTPoints_SkipsUnknownType(t *testing.T) {
 	t.Parallel()
 
-	readings := []TypedCTReading{
+	readings := []gateway.TypedCTReading{
 		{
 			CTReading:       gateway.CTReading{Channels: []gateway.CTChannel{{ActivePower: 50}}},
 			MeasurementType: "unknown-type",
@@ -177,8 +177,8 @@ func TestScrape_AllSources(t *testing.T) {
 		InvertersFunc: func(_ context.Context) ([]gateway.InverterReading, error) {
 			return []gateway.InverterReading{{SerialNumber: "S1", LastReportWatts: 50}}, nil
 		},
-		TypedMeterReadingsFunc: func(_ context.Context) ([]TypedCTReading, error) {
-			return []TypedCTReading{{
+		TypedMeterReadingsFunc: func(_ context.Context) ([]gateway.TypedCTReading, error) {
+			return []gateway.TypedCTReading{{
 				CTReading:       gateway.CTReading{Channels: []gateway.CTChannel{{ActivePower: 100}}},
 				MeasurementType: MeasurementProduction,
 			}}, nil
@@ -234,7 +234,7 @@ func TestScrape_PartialErrors(t *testing.T) {
 		InvertersFunc: func(_ context.Context) ([]gateway.InverterReading, error) {
 			return nil, errors.New("inverter error")
 		},
-		TypedMeterReadingsFunc: func(_ context.Context) ([]TypedCTReading, error) {
+		TypedMeterReadingsFunc: func(_ context.Context) ([]gateway.TypedCTReading, error) {
 			return nil, errors.New("ct error")
 		},
 	}
@@ -253,7 +253,7 @@ func TestScrape_CTNotFound(t *testing.T) {
 		LiveDataFunc: func(_ context.Context) (gateway.LiveData, error) {
 			return makeLiveData(1000000, 0, 0, 1000000), nil
 		},
-		TypedMeterReadingsFunc: func(_ context.Context) ([]TypedCTReading, error) {
+		TypedMeterReadingsFunc: func(_ context.Context) ([]gateway.TypedCTReading, error) {
 			return nil, &gateway.Error{StatusCode: 404, Endpoint: "/ivp/meters/readings"}
 		},
 	}
