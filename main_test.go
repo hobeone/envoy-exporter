@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	jwt "github.com/golang-jwt/jwt/v4"
+	jwt "github.com/golang-jwt/jwt/v5"
 	gateway "github.com/hobeone/enphase-gateway"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
