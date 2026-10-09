@@ -2,7 +2,7 @@ module github.com/hobeone/envoy-exporter
 
 go 1.25.0
 
-toolchain go1.26.6
+toolchain go1.27.2
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
